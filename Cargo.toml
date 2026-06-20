@@ -1,0 +1,65 @@
+[package]
+name = "catarnith"
+version = "0.1.0"
+edition = "2026"
+description = "Terminal-first Solana Pump.fun trading app with paper mode and gated live execution."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/jxstme22/catarnith"
+homepage = "https://github.com/jxstme22/catarnith"
+keywords = ["solana", "trading", "tui", "pumpfun"]
+categories = ["command-line-utilities"]
+autobins = false
+
+[features]
+default = ["live-executor", "tui"]
+live-executor = [
+    "dep:fs2",
+    "dep:pump-rust-client",
+    "dep:solana-client",
+    "dep:solana-sdk",
+    "dep:bincode",
+]
+tui = [
+    "dep:ratatui",
+    "dep:crossterm",
+]
+
+[[bin]]
+name = "catarnith"
+path = "src/bin/catarnith/main.rs"
+required-features = ["live-executor", "tui"]
+
+[[bin]]
+name = "bot"
+path = "src/bin/bot.rs"
+required-features = ["live-executor"]
+
+[[bin]]
+name = "live_execute"
+path = "src/bin/live_execute.rs"
+required-features = ["live-executor"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bincode = { version = "1.3", optional = true }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+fs2 = { version = "0.4", optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+solana-pubkey = { version = "4.2", features = ["curve25519"] }
+solana-client = { version = "2.1.21", optional = true }
+solana-sdk = { version = "2.1.21", optional = true }
+pump-rust-client = { version = "=0.1.8", features = ["client"], optional = true }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"], optional = true }
+crossterm = { version = "0.28", features = ["event-stream"], optional = true }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2"

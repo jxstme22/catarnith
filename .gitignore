@@ -1,0 +1,9 @@
+/target
+/config.toml
+/docs
+*.log
+*.jsonl
+.env
+
+# Local agent / editor state
+.DS_Store

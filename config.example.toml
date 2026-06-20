@@ -1,0 +1,134 @@
+# Example Catarnith config. Copy to config.toml. Starts in PAPER mode.
+#
+# Keys tagged [TUI] below are editable in-app via Settings ([S] in the
+# mode picker). Everything else is edited here. `.env` overrides the
+# matching values at runtime — see .env.example.
+#
+# Required to do anything useful: mode, helius_api_key (or HELIUS_API_KEY
+# in .env), and base_buy_lamports. The rest have safe defaults.
+
+mode = "paper"                  # [TUI] "paper" or "live"
+helius_api_key = "PUT_YOUR_HELIUS_KEY_HERE"  # required (or set HELIUS_API_KEY in .env)
+wallet_keypair_path = ""        # [TUI] path to keypair JSON (or set the base58 key in .env)
+
+pumpfun_program = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+pumpswap_program = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+mayhem_program = "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e"
+mayhem_agent_wallet = "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s"
+token_2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+axiom_route_program = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
+axiom_jito_marker = "jitodontfrontB1111111TradeWithAxiomDotTrade"
+pair_scope = "mayhem_only" # [TUI] "mayhem_only" or "all_pumpfun"
+
+# Strict default: generic pumpfun/token-2022 candidates are observable only.
+# The bot enters only when:
+# 1. the mint is verified by a trusted Mayhem mint source, and
+# 2. the observed execution route matches the wallet pattern: Axiom -> Pump.fun/PumpSwap.
+require_mayhem_evidence = true
+allow_indirect_mayhem_candidates = false
+require_route_confirmation = true
+require_reference_wallet_signal = false
+follow_observed_sell_signals = true
+mayhem_mint_allowlist_path = "" # optional newline-delimited verified Mayhem mint list
+mayhem_metadata_url_template = "" # optional trusted endpoint, e.g. "https://.../{mint}"
+mayhem_metadata_timeout_ms = 750
+mayhem_evidence_min_confidence = 0.9
+pulse_mints_path = "" # optional live JSONL file tailed for verified discoveries
+require_discovery_signal = false
+allow_onchain_mayhem_discovery = true
+require_curve_mayhem_flag = false
+require_fresh_mint_creation = false # live speed mode should require Pump Create/CreateV2
+max_stream_event_age_ms = 500 # reject events delayed in the local queue
+entry_deadline_ms = 550
+max_create_event_slot_lag = 2 # reject create events already behind the current slot
+max_entry_curve_slot_ahead = 8
+
+# Optional opponent-model filters for observed wallet/agent buys.
+# Omit max_* values to leave them unlimited.
+min_observed_buy_lamports = 0
+# max_observed_buy_lamports = 500000000
+# max_observed_buys_before_entry = 1
+# max_observed_sells_before_entry = 0
+
+# Reference wallet is optional; used for SOL delta reconstruction when watching it.
+target_wallet = "8UbptT8bqtXVKvHkMwEkWqrRLQ5mTs2whQbY5Twfwhfi"
+watched_wallets = []
+
+base_buy_lamports = 13025001    # [TUI] buy size in lamports (1 SOL = 1e9)
+max_open_positions = 3          # [TUI] max concurrent open positions
+max_buys_per_mint = 5
+max_total_lamports_per_mint = 100000000
+max_total_open_lamports = 300000000
+max_daily_loss_lamports = 500000000  # [TUI] daily loss limit (entered as SOL in-app)
+max_failed_txs_per_minute = 30
+max_failed_fee_burn_lamports_per_hour = 20000000
+max_slippage_bps = 1500         # [TUI] max buy slippage in bps
+# Paper-mode simulation tuning (ignored in live mode).
+paper_slippage_bps = 300
+paper_fee_lamports_floor = 5000
+
+take_profit_bps = 8000          # [TUI] take-profit trigger in bps
+take_profit_sell_bps = 10000
+stop_loss_bps = 3500            # [TUI] stop-loss trigger in bps
+burst_entry_seconds = 60
+max_hold_seconds = 180          # [TUI] forced exit after N seconds
+cooldown_seconds_per_mint = 60
+market_quote_max_age_ms = 2000
+unpriced_exit_grace_ms = 3000
+enable_curve_exit_quotes = true
+exit_check_interval_ms = 100
+enable_take_profit_exit = true
+enable_stop_loss_exit = true
+curve_observation_seconds = 180
+
+enable_live_trading = false
+require_manual_live_unlock = true
+hot_wallet_marker_required = true
+main_wallet_markers = ["main", "cold", "treasury"]
+
+subscribe_commitment = "processed"
+subscribe_programs = true
+enable_transaction_subscribe = true
+enable_logs_fallback = true
+fetch_full_transaction = true
+# Paper-only: price entries from the observed signal transaction. Useful when
+# logsSubscribe + getTransaction makes the current curve snapshot non-causal.
+use_observed_entry_fill = false
+# Keep startup cheap by default. Set >0 only for intentional paper/research backfill.
+backfill_limit = 0
+
+journal_dir = "journals/bot"
+sqlite_path = "journals/bot/mayhem.sqlite"
+paper_report_path = ""
+horizon_report_path = ""
+
+# Live execution tuning. Ignored in paper mode. Every key here also
+# accepts a matching CTARNITH_LIVE_* env override at runtime (the env var
+# wins when set). Legacy MAYHEM_* names are also read as fallbacks.
+#
+# To actually arm live trading you must ALSO set, above:
+#   mode = "live"
+#   enable_live_trading = true
+#   require_manual_live_unlock = false
+# and provide a hot-wallet key (wallet_keypair_path or the base58 key in
+# .env). Protective gates still apply: the wallet must live outside the
+# repo, secret files must be chmod 600, CTARNITH_FALLBACK_RPC_URL must be a
+# distinct paid RPC, and max_balance_lamports caps the wallet size.
+[live]
+compute_unit_limit = 400000               # CTARNITH_LIVE_COMPUTE_UNIT_LIMIT
+compute_unit_price_microlamports = 1      # CTARNITH_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS (priority fee)
+send_max_retries = 2                      # CTARNITH_LIVE_SEND_MAX_RETRIES
+send_timeout_ms = 750                     # CTARNITH_LIVE_SEND_TIMEOUT_MS
+rpc_timeout_ms = 900                      # CTARNITH_LIVE_RPC_TIMEOUT_MS
+confirmation_timeout_ms = 5000            # CTARNITH_LIVE_CONFIRMATION_TIMEOUT_MS
+sell_confirmation_timeout_ms = 5000       # CTARNITH_LIVE_SELL_CONFIRMATION_TIMEOUT_MS
+confirmation_poll_ms = 200                # CTARNITH_LIVE_CONFIRMATION_POLL_MS
+pre_broadcast_simulation = true           # CTARNITH_LIVE_PRE_BROADCAST_SIMULATION
+settlement_commitment = "processed"       # CTARNITH_LIVE_SETTLEMENT_COMMITMENT (processed|confirmed|finalized)
+# sell_slippage_bps = 1000                # CTARNITH_LIVE_SELL_SLIPPAGE_BPS (omit to reuse max_slippage_bps)
+max_balance_lamports = 50000000           # CTARNITH_LIVE_MAX_BALANCE_LAMPORTS (refuse to trade above this; 0.05 SOL)
+jito_tip_lamports = 10000                 # CTARNITH_LIVE_JITO_TIP_LAMPORTS
+jupiter_timeout_ms = 10000                # CTARNITH_LIVE_JUPITER_TIMEOUT_MS (sell fallback; needs JUP_API_KEY in .env)
+# Optional Jito panic-sell tip path. Set both to enable.
+# jito_block_engine_url = "https://mainnet.block-engine.jito.wtf/api/v1/transactions"  # CTARNITH_LIVE_JITO_BLOCK_ENGINE_URL
+# jito_tip_account = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"                     # CTARNITH_LIVE_JITO_TIP_ACCOUNT
