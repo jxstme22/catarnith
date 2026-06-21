@@ -619,7 +619,7 @@ mod imp {
                 .first()
                 .copied()
                 .context("signed live transaction has no signature")?;
-            let send_config = RpcSendTransactionConfig {
+            let primary_config = RpcSendTransactionConfig {
                 // The speed profile may skip local simulation. Avoid paying
                 // for an additional RPC-side simulation before broadcast.
                 skip_preflight: true,
@@ -635,25 +635,65 @@ mod imp {
                 max_retries: Some(self.send_max_retries),
                 ..RpcSendTransactionConfig::default()
             };
-            let (primary_result, fallback_result) = tokio::join!(
-                send_transaction_bounded(
-                    self.rpc.as_ref(),
-                    &built.transaction,
-                    send_config,
-                    primary_timeout,
-                    "primary",
-                ),
-                send_transaction_bounded(
-                    &self.fallback_rpc,
-                    &built.transaction,
-                    fallback_config,
-                    fallback_timeout,
-                    "fallback",
-                ),
+            let primary = send_transaction_bounded(
+                self.rpc.as_ref(),
+                &built.transaction,
+                primary_config,
+                primary_timeout,
+                "primary",
             );
-            let signature = match (primary_result, fallback_result) {
-                (Ok(signature), _) | (_, Ok(signature)) => signature,
-                (Err(primary_error), Err(fallback_error)) => {
+            let fallback = send_transaction_bounded(
+                &self.fallback_rpc,
+                &built.transaction,
+                fallback_config,
+                fallback_timeout,
+                "fallback",
+            );
+            let jito = self.jito_block_engine_url.as_ref().map(|url| {
+                let client = RpcClient::new_with_timeout_and_commitment(
+                    url.clone(),
+                    fallback_timeout,
+                    self.settlement_commitment,
+                );
+                let tx = built.transaction.clone();
+                let cfg = RpcSendTransactionConfig {
+                    skip_preflight: true,
+                    max_retries: Some(self.send_max_retries),
+                    ..RpcSendTransactionConfig::default()
+                };
+                async move {
+                    send_transaction_bounded(&client, &tx, cfg, fallback_timeout, "jito").await
+                }
+            });
+            let (primary_result, fallback_result, jito_result) = match jito {
+                Some(j) => {
+                    let (p, f, j) = tokio::join!(primary, fallback, j);
+                    (p, f, Some(j))
+                }
+                None => {
+                    let (p, f) = tokio::join!(primary, fallback);
+                    (p, f, None)
+                }
+            };
+            let signature = match (primary_result, fallback_result, jito_result) {
+                (Ok(signature), _, _) | (_, Ok(signature), _) | (_, _, Some(Ok(signature))) => {
+                    signature
+                }
+                (Err(primary_error), Err(fallback_error), Some(Err(jito_error))) => {
+                    return self
+                        .reconcile_ambiguous_broadcast(
+                            order,
+                            expected_signature,
+                            built,
+                            started,
+                            format!(
+                                "broadcast failed on primary ({primary_error}), fallback \
+                                 ({fallback_error}), and jito ({jito_error})"
+                            ),
+                        )
+                        .await;
+                }
+                (Err(primary_error), Err(fallback_error), None) => {
                     return self
                         .reconcile_ambiguous_broadcast(
                             order,

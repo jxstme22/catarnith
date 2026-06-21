@@ -1,6 +1,8 @@
 /target
 /config.toml
 /docs
+/journals
+.planning
 *.log
 *.jsonl
 .env

@@ -9,9 +9,10 @@ interactive TUI, one autonomous scanner, and one live execution helper:
 - `live_execute` - one-shot live buy/sell helper used by the TUI panic-sell
   path and by operators who want a direct CLI.
 
-The app is paper-first by default. Live trading only broadcasts when the config
-is deliberately armed with `mode = "live"`, `enable_live_trading = true`, and
-`require_manual_live_unlock = false`, plus the live wallet and RPC safeguards.
+The app is paper-first by default. In the TUI, `[2] Live Trade` and `[3] Paper
+Trade` are the runtime source of truth. Live trading only broadcasts when Live
+is selected and the config is deliberately armed with `enable_live_trading = true`
+and `require_manual_live_unlock = false`, plus the live wallet and RPC safeguards.
 
 ## Quickstart
 
@@ -41,7 +42,7 @@ Use `--locked`: the project pins Solana and Pump client dependencies in
 [1] Auto Bot            autonomous scanner/trader loop
 [2] Live Trade          single live trade flow
 [3] Paper Trade         paper trading, no real orders
-[S] Settings            wallet, keys, buy size, risk knobs
+[S] Settings            wallet, keys, buy size, live setup
 ```
 
 On a first run with no local config or `.env`, Catarnith opens Settings first.
@@ -56,8 +57,9 @@ Catarnith uses one local profile by default: `config.toml`.
 - Keep both local files out of git; they are ignored.
 - `.env` overrides matching TOML values at runtime.
 
-Both paper and live mode load `config.toml` unless you explicitly pass
-`--config <PATH>` or set `CTARNITH_LIVE_CONFIG`. The old
+Both paper and live picker modes load `config.toml` unless you explicitly pass
+`--config <PATH>` or set `CTARNITH_LIVE_CONFIG`; the picker overrides the
+file's `mode` value for that run. The old
 `MAYHEM_*` environment names are still accepted as read-only fallbacks, but new
 local setup should use `CTARNITH_*`.
 
@@ -90,7 +92,8 @@ journals only.
 
 Live mode refuses to start unless:
 
-- `mode = "live"`
+- `[2] Live Trade` is selected in the picker, or `mode = "live"` is set for a
+  direct `catarnith scan`/bot run
 - `enable_live_trading = true`
 - `require_manual_live_unlock = false`
 - a dedicated hot-wallet key is configured outside the repository

@@ -1,15 +1,16 @@
 # Example Catarnith config. Copy to config.toml. Starts in PAPER mode.
 #
-# Keys tagged [TUI] below are editable in-app via Settings ([S] in the
-# mode picker). Everything else is edited here. `.env` overrides the
-# matching values at runtime — see .env.example.
+# Keys tagged [Settings] below are editable in-app via Settings ([S] in the
+# mode picker). Keys tagged [Auto Bot Setup] are edited before starting mode 1.
+# Everything else is edited here. `.env` overrides matching values at runtime —
+# see .env.example.
 #
 # Required to do anything useful: mode, helius_api_key (or HELIUS_API_KEY
 # in .env), and base_buy_lamports. The rest have safe defaults.
 
-mode = "paper"                  # [TUI] "paper" or "live"
+mode = "paper"                  # default for direct scan/bot runs; TUI Live/Paper picker overrides this
 helius_api_key = "PUT_YOUR_HELIUS_KEY_HERE"  # required (or set HELIUS_API_KEY in .env)
-wallet_keypair_path = ""        # [TUI] path to keypair JSON (or set the base58 key in .env)
+wallet_keypair_path = ""        # path to keypair JSON (or set the base58 key in .env/Settings)
 
 pumpfun_program = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 pumpswap_program = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -18,7 +19,7 @@ mayhem_agent_wallet = "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s"
 token_2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 axiom_route_program = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
 axiom_jito_marker = "jitodontfrontB1111111TradeWithAxiomDotTrade"
-pair_scope = "mayhem_only" # [TUI] "mayhem_only" or "all_pumpfun"
+pair_scope = "mayhem_only" # [Auto Bot Setup] "mayhem_only" or "all_pumpfun"
 
 # Strict default: generic pumpfun/token-2022 candidates are observable only.
 # The bot enters only when:
@@ -54,24 +55,24 @@ min_observed_buy_lamports = 0
 target_wallet = "8UbptT8bqtXVKvHkMwEkWqrRLQ5mTs2whQbY5Twfwhfi"
 watched_wallets = []
 
-base_buy_lamports = 13025001    # [TUI] buy size in lamports (1 SOL = 1e9)
-max_open_positions = 3          # [TUI] max concurrent open positions
+base_buy_lamports = 13025001    # [Settings + Auto Bot Setup] buy size in lamports (1 SOL = 1e9)
+max_open_positions = 3          # max concurrent open positions
 max_buys_per_mint = 5
 max_total_lamports_per_mint = 100000000
 max_total_open_lamports = 300000000
-max_daily_loss_lamports = 500000000  # [TUI] daily loss limit (entered as SOL in-app)
+max_daily_loss_lamports = 500000000  # daily loss limit
 max_failed_txs_per_minute = 30
 max_failed_fee_burn_lamports_per_hour = 20000000
-max_slippage_bps = 1500         # [TUI] max buy slippage in bps
+max_slippage_bps = 1500         # [Settings + Auto Bot Setup] max buy slippage in bps
 # Paper-mode simulation tuning (ignored in live mode).
 paper_slippage_bps = 300
 paper_fee_lamports_floor = 5000
 
-take_profit_bps = 8000          # [TUI] take-profit trigger in bps
+take_profit_bps = 8000          # take-profit trigger in bps
 take_profit_sell_bps = 10000
-stop_loss_bps = 3500            # [TUI] stop-loss trigger in bps
+stop_loss_bps = 3500            # stop-loss trigger in bps
 burst_entry_seconds = 60
-max_hold_seconds = 180          # [TUI] forced exit after N seconds
+max_hold_seconds = 180          # [Settings + Auto Bot Setup] forced exit after N seconds
 cooldown_seconds_per_mint = 60
 market_quote_max_age_ms = 2000
 unpriced_exit_grace_ms = 3000
@@ -81,8 +82,8 @@ enable_take_profit_exit = true
 enable_stop_loss_exit = true
 curve_observation_seconds = 180
 
-enable_live_trading = false
-require_manual_live_unlock = true
+enable_live_trading = false     # [Settings advanced live] must be true before live broadcast
+require_manual_live_unlock = true # [Settings advanced live] must be false before live broadcast
 hot_wallet_marker_required = true
 main_wallet_markers = ["main", "cold", "treasury"]
 
@@ -116,19 +117,19 @@ horizon_report_path = ""
 # distinct paid RPC, and max_balance_lamports caps the wallet size.
 [live]
 compute_unit_limit = 400000               # CTARNITH_LIVE_COMPUTE_UNIT_LIMIT
-compute_unit_price_microlamports = 1      # CTARNITH_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS (priority fee)
+compute_unit_price_microlamports = 100000 # [Settings advanced live] CTARNITH_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS (priority fee)
 send_max_retries = 2                      # CTARNITH_LIVE_SEND_MAX_RETRIES
 send_timeout_ms = 750                     # CTARNITH_LIVE_SEND_TIMEOUT_MS
 rpc_timeout_ms = 900                      # CTARNITH_LIVE_RPC_TIMEOUT_MS
 confirmation_timeout_ms = 5000            # CTARNITH_LIVE_CONFIRMATION_TIMEOUT_MS
 sell_confirmation_timeout_ms = 5000       # CTARNITH_LIVE_SELL_CONFIRMATION_TIMEOUT_MS
-confirmation_poll_ms = 200                # CTARNITH_LIVE_CONFIRMATION_POLL_MS
-pre_broadcast_simulation = true           # CTARNITH_LIVE_PRE_BROADCAST_SIMULATION
+confirmation_poll_ms = 200                # [Settings advanced live] CTARNITH_LIVE_CONFIRMATION_POLL_MS
+pre_broadcast_simulation = true           # [Settings advanced live] CTARNITH_LIVE_PRE_BROADCAST_SIMULATION
 settlement_commitment = "processed"       # CTARNITH_LIVE_SETTLEMENT_COMMITMENT (processed|confirmed|finalized)
-# sell_slippage_bps = 1000                # CTARNITH_LIVE_SELL_SLIPPAGE_BPS (omit to reuse max_slippage_bps)
-max_balance_lamports = 50000000           # CTARNITH_LIVE_MAX_BALANCE_LAMPORTS (refuse to trade above this; 0.05 SOL)
-jito_tip_lamports = 10000                 # CTARNITH_LIVE_JITO_TIP_LAMPORTS
+sell_slippage_bps = 1500                  # [Settings advanced live] CTARNITH_LIVE_SELL_SLIPPAGE_BPS
+max_balance_lamports = 50000000           # [Settings advanced live] CTARNITH_LIVE_MAX_BALANCE_LAMPORTS (refuse to trade above this; 0.05 SOL)
+jito_block_engine_url = "https://singapore.mainnet.block-engine.jito.wtf/api/v1/transactions" # [Settings advanced live]
+jito_tip_lamports = 100000                # [Settings advanced live] CTARNITH_LIVE_JITO_TIP_LAMPORTS
 jupiter_timeout_ms = 10000                # CTARNITH_LIVE_JUPITER_TIMEOUT_MS (sell fallback; needs JUP_API_KEY in .env)
 # Optional Jito panic-sell tip path. Set both to enable.
-# jito_block_engine_url = "https://mainnet.block-engine.jito.wtf/api/v1/transactions"  # CTARNITH_LIVE_JITO_BLOCK_ENGINE_URL
 # jito_tip_account = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"                     # CTARNITH_LIVE_JITO_TIP_ACCOUNT

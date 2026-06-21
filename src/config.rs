@@ -713,6 +713,11 @@ impl Config {
         Ok(cfg)
     }
 
+    pub fn apply_runtime_mode(&mut self, mode: Mode) -> Result<()> {
+        self.mode = mode;
+        self.apply_live_env_overrides()
+    }
+
     fn apply_live_env_overrides(&mut self) -> Result<()> {
         if self.mode != Mode::Live {
             return Ok(());

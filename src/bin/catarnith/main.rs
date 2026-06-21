@@ -135,16 +135,19 @@ pub enum SettingsField {
     FallbackRpc,
     JupiterKey,
     SlippageBps,
-    MaxHoldSecs,
     Theme,
-    Mode,
-    PairScope,
-    /// Expand/collapse the advanced risk options below. Toggled with ←/→.
+    /// Expand/collapse the advanced live trade options below. Toggled with ←/→.
     AdvancedToggle,
-    TakeProfitBps,
-    StopLossBps,
-    MaxOpenPositions,
-    DailyLossSol,
+    EnableLiveTrading,
+    RequireManualLiveUnlock,
+    LiveMaxBalanceSol,
+    MaxHoldSecs,
+    SellSlippageBps,
+    PriorityFee,
+    JitoUrl,
+    JitoTipLamports,
+    ConfirmationPollMs,
+    PreBroadcastSimulation,
 }
 
 impl SettingsField {
@@ -154,7 +157,16 @@ impl SettingsField {
         use SettingsField::*;
         matches!(
             self,
-            TakeProfitBps | StopLossBps | MaxOpenPositions | DailyLossSol
+            EnableLiveTrading
+                | RequireManualLiveUnlock
+                | LiveMaxBalanceSol
+                | MaxHoldSecs
+                | SellSlippageBps
+                | PriorityFee
+                | JitoUrl
+                | JitoTipLamports
+                | ConfirmationPollMs
+                | PreBroadcastSimulation
         )
     }
 }
@@ -170,16 +182,19 @@ fn next_field(f: SettingsField, show_advanced: bool) -> SettingsField {
         HeliusKey => FallbackRpc,
         FallbackRpc => JupiterKey,
         JupiterKey => SlippageBps,
-        SlippageBps => MaxHoldSecs,
-        MaxHoldSecs => Theme,
-        Theme => Mode,
-        Mode => PairScope,
-        PairScope => AdvancedToggle,
-        AdvancedToggle => TakeProfitBps,
-        TakeProfitBps => StopLossBps,
-        StopLossBps => MaxOpenPositions,
-        MaxOpenPositions => DailyLossSol,
-        DailyLossSol => Wallet,
+        SlippageBps => Theme,
+        Theme => AdvancedToggle,
+        AdvancedToggle => EnableLiveTrading,
+        EnableLiveTrading => RequireManualLiveUnlock,
+        RequireManualLiveUnlock => LiveMaxBalanceSol,
+        LiveMaxBalanceSol => MaxHoldSecs,
+        MaxHoldSecs => SellSlippageBps,
+        SellSlippageBps => PriorityFee,
+        PriorityFee => JitoUrl,
+        JitoUrl => JitoTipLamports,
+        JitoTipLamports => ConfirmationPollMs,
+        ConfirmationPollMs => PreBroadcastSimulation,
+        PreBroadcastSimulation => Wallet,
     };
     if next.is_advanced() && !show_advanced {
         Wallet
@@ -196,7 +211,7 @@ fn prev_field(f: SettingsField, show_advanced: bool) -> SettingsField {
     let prev = match f {
         Wallet => {
             if show_advanced {
-                DailyLossSol
+                PreBroadcastSimulation
             } else {
                 AdvancedToggle
             }
@@ -206,15 +221,18 @@ fn prev_field(f: SettingsField, show_advanced: bool) -> SettingsField {
         FallbackRpc => HeliusKey,
         JupiterKey => FallbackRpc,
         SlippageBps => JupiterKey,
-        MaxHoldSecs => SlippageBps,
-        Theme => MaxHoldSecs,
-        Mode => Theme,
-        PairScope => Mode,
-        AdvancedToggle => PairScope,
-        TakeProfitBps => AdvancedToggle,
-        StopLossBps => TakeProfitBps,
-        MaxOpenPositions => StopLossBps,
-        DailyLossSol => MaxOpenPositions,
+        Theme => SlippageBps,
+        AdvancedToggle => Theme,
+        EnableLiveTrading => AdvancedToggle,
+        RequireManualLiveUnlock => EnableLiveTrading,
+        LiveMaxBalanceSol => RequireManualLiveUnlock,
+        MaxHoldSecs => LiveMaxBalanceSol,
+        SellSlippageBps => MaxHoldSecs,
+        PriorityFee => SellSlippageBps,
+        JitoUrl => PriorityFee,
+        JitoTipLamports => JitoUrl,
+        ConfirmationPollMs => JitoTipLamports,
+        PreBroadcastSimulation => ConfirmationPollMs,
     };
     if prev.is_advanced() && !show_advanced {
         AdvancedToggle
@@ -323,16 +341,19 @@ pub struct SettingsState {
     pub fallback_rpc: String,
     pub jupiter_key: String,
     pub slippage_bps: String,
-    pub max_hold_secs: String,
     pub theme: Theme,
-    pub mode: Mode,
-    pub pair_scope: PairScope,
-    /// Advanced (risk) fields, edited only when `show_advanced` is on.
-    pub take_profit_bps: String,
-    pub stop_loss_bps: String,
-    pub max_open_positions: String,
-    pub daily_loss_sol: String,
-    /// Whether the advanced risk section is expanded.
+    /// Advanced live-trade fields, edited only when `show_advanced` is on.
+    pub enable_live_trading: bool,
+    pub require_manual_live_unlock: bool,
+    pub live_max_balance_sol: String,
+    pub max_hold_secs: String,
+    pub sell_slippage_bps: String,
+    pub priority_fee_microlamports: String,
+    pub jito_block_engine_url: String,
+    pub jito_tip_lamports: String,
+    pub confirmation_poll_ms: String,
+    pub pre_broadcast_simulation: bool,
+    /// Whether the advanced live-trade section is expanded.
     pub show_advanced: bool,
     pub active_field: SettingsField,
     pub error: Option<String>,
@@ -348,14 +369,17 @@ impl Default for SettingsState {
             fallback_rpc: String::new(),
             jupiter_key: String::new(),
             slippage_bps: String::new(),
-            max_hold_secs: String::new(),
             theme: Theme::Mono,
-            mode: Mode::Paper,
-            pair_scope: PairScope::MayhemOnly,
-            take_profit_bps: String::new(),
-            stop_loss_bps: String::new(),
-            max_open_positions: String::new(),
-            daily_loss_sol: String::new(),
+            enable_live_trading: false,
+            require_manual_live_unlock: true,
+            live_max_balance_sol: String::new(),
+            max_hold_secs: String::new(),
+            sell_slippage_bps: String::new(),
+            priority_fee_microlamports: String::new(),
+            jito_block_engine_url: String::new(),
+            jito_tip_lamports: String::new(),
+            confirmation_poll_ms: String::new(),
+            pre_broadcast_simulation: true,
             show_advanced: false,
             active_field: SettingsField::default(),
             error: None,
@@ -480,6 +504,9 @@ pub struct ScanState {
     /// Transient error message shown on the mode picker when a
     /// mode fails to start (e.g. RPC unreachable, config invalid).
     pub last_error: Option<String>,
+    /// Resolved config path shown in the mode picker. This is set
+    /// from the actual startup path, not from late `.env` overrides.
+    pub config_label: String,
     /// Settings editor state.
     pub settings: SettingsState,
     /// Auto Bot setup editor state.
@@ -521,6 +548,7 @@ impl ScanState {
             last_panic_signature: None,
             status_line: String::new(),
             last_error: None,
+            config_label: "config.toml".to_string(),
             settings: SettingsState::new(),
             bot_settings: BotSettingsState::new(),
             confirm_exit: false,
@@ -556,15 +584,17 @@ impl SettingsState {
         self.jupiter_key.clear();
         self.slippage_bps.clear();
         self.max_hold_secs.clear();
-        self.take_profit_bps.clear();
-        self.stop_loss_bps.clear();
-        self.max_open_positions.clear();
-        self.daily_loss_sol.clear();
+        self.live_max_balance_sol.clear();
+        self.sell_slippage_bps.clear();
+        self.priority_fee_microlamports.clear();
+        self.jito_block_engine_url.clear();
+        self.jito_tip_lamports.clear();
+        self.confirmation_poll_ms.clear();
         self.show_advanced = false;
         self.active_field = SettingsField::Wallet;
         self.error = None;
         self.saved = false;
-        // theme/mode are left at their loaded values.
+        // theme/live toggles are left at their loaded values.
     }
 }
 
@@ -858,7 +888,7 @@ fn print_help() {
     eprintln!("    --help, -h        Print this help and exit.");
     eprintln!();
     eprintln!("ENVIRONMENT:");
-    eprintln!("    CTARNITH_LIVE_CONFIG       Override the config path (legacy MAYHEM_LIVE_CONFIG still honored).");
+    eprintln!("    CTARNITH_LIVE_CONFIG       Override the config path.");
     eprintln!("    PYTH_SOL_USD_FEED_ID       Override the Pyth SOL/USD feed id.");
 }
 
@@ -923,8 +953,8 @@ fn run_subcommand_panic_sell(extra: &[String]) -> Result<()> {
     }
     let mint = &extra[0];
     // Honor --config if the user passed it after the mint.
-    let mut config_arg =
-        catarnith::config::env_lookup("MAYHEM_LIVE_CONFIG").unwrap_or_else(|| "config.toml".into());
+    let mut config_arg = catarnith::config::env_var("CTARNITH_LIVE_CONFIG", "MAYHEM_LIVE_CONFIG")
+        .unwrap_or_else(|_| "config.toml".into());
     let mut i = 1;
     while i < extra.len() {
         if extra[i] == "--config" && i + 1 < extra.len() {
@@ -1006,12 +1036,14 @@ impl Args {
                 }
             }
         }
-        // Honor CTARNITH_LIVE_CONFIG when exported. The lookup also accepts
-        // the legacy MAYHEM_LIVE_CONFIG alias.
-        // Otherwise keep the explicit
+        // Honor CTARNITH_LIVE_CONFIG when exported. Otherwise keep the explicit
         // --config / default.
-        if let Some(env_cfg) = catarnith::config::env_lookup("MAYHEM_LIVE_CONFIG") {
-            config = std::path::PathBuf::from(env_cfg);
+        if !config_explicit {
+            if let Ok(env_cfg) =
+                catarnith::config::env_var("CTARNITH_LIVE_CONFIG", "MAYHEM_LIVE_CONFIG")
+            {
+                config = std::path::PathBuf::from(env_cfg);
+            }
         }
         config = resolve_config_path(config);
         (Self { config }, first_positional, config_explicit)
@@ -1303,6 +1335,7 @@ fn spawn_strategy(
         // -----------------------------------------------------------------
         {
             let mut s = state.write().await;
+            s.config_label = config_path.to_string_lossy().to_string();
             reset_trade_state(&mut s);
             s.phase = Phase::Welcome;
             let _ = event_tx.send(ScanEvent::StateChanged);
@@ -1485,7 +1518,11 @@ fn spawn_strategy(
 async fn resolve_trade_config(base: &Config, mode: Mode, explicit: bool) -> Result<Config> {
     if explicit {
         let mut cfg = base.clone();
-        cfg.mode = mode;
+        cfg.apply_runtime_mode(mode)?;
+        cfg.validate_for_bot()?;
+        if cfg.mode != Mode::Paper {
+            cfg.validate_live_risk_envelope("catarnith scan")?;
+        }
         return Ok(cfg);
     }
     let path = match mode {
@@ -1494,6 +1531,10 @@ async fn resolve_trade_config(base: &Config, mode: Mode, explicit: bool) -> Resu
     };
     let p = resolve_config_path(std::path::PathBuf::from(path));
     let mut cfg = Config::load(&p)?;
+    // The mode picker is the runtime source of truth. `config.toml` still
+    // carries a default for CLI/non-picker runs, but an in-TUI pick must
+    // never be overridden by a stale `mode = ...` value on disk.
+    cfg.apply_runtime_mode(mode)?;
     // Ensure the helius API key is present. Config::load calls
     // apply_dot_env() which finds .env by walking up from CWD,
     // but CWD may not be in the workspace. Fall back to:
@@ -2594,15 +2635,19 @@ async fn run_settings(
         helius_key,
         slippage_bps,
         max_hold_secs,
-        mode,
-        take_profit_bps,
-        stop_loss_bps,
-        max_open_positions,
-        daily_loss_sol,
-        pair_scope,
+        enable_live_trading,
+        require_manual_live_unlock,
+        live_max_balance_sol,
+        sell_slippage_bps,
+        priority_fee_microlamports,
+        jito_block_engine_url,
+        jito_tip_lamports,
+        confirmation_poll_ms,
+        pre_broadcast_simulation,
     ) = {
         let content = std::fs::read_to_string(config_path).unwrap_or_default();
         let table: toml::Table = content.parse().unwrap_or_default();
+        let live_table = table.get("live").and_then(|v| v.as_table());
         let lamports = table
             .get("base_buy_lamports")
             .and_then(|v| v.as_integer())
@@ -2616,58 +2661,104 @@ async fn run_settings(
             .filter(|s| !s.trim().is_empty())
             .or_else(|| std::env::var("HELIUS_API_KEY").ok())
             .unwrap_or_default();
-        let slippage_bps = table
+        let mut slippage_bps = table
             .get("max_slippage_bps")
             .and_then(|v| v.as_integer())
             .unwrap_or(1500)
             .to_string();
-        let max_hold_secs = table
+        slippage_bps =
+            catarnith::config::env_lookup("MAYHEM_LIVE_MAX_SLIPPAGE_BPS").unwrap_or(slippage_bps);
+        let mut max_hold_secs = table
             .get("max_hold_seconds")
             .and_then(|v| v.as_integer())
             .unwrap_or(180)
             .to_string();
-        let mode = match table.get("mode").and_then(|v| v.as_str()) {
-            Some("live") => Mode::Live,
-            _ => Mode::Paper,
-        };
-        let take_profit_bps = table
-            .get("take_profit_bps")
+        max_hold_secs =
+            catarnith::config::env_lookup("MAYHEM_LIVE_MAX_HOLD_SECONDS").unwrap_or(max_hold_secs);
+        let mut enable_live_trading = table
+            .get("enable_live_trading")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        enable_live_trading =
+            env_bool_lookup("MAYHEM_LIVE_ENABLE_LIVE_TRADING", enable_live_trading);
+        let mut require_manual_live_unlock = table
+            .get("require_manual_live_unlock")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        require_manual_live_unlock = env_bool_lookup(
+            "MAYHEM_LIVE_REQUIRE_MANUAL_LIVE_UNLOCK",
+            require_manual_live_unlock,
+        );
+        let mut live_max_balance_lamports = live_table
+            .and_then(|t| t.get("max_balance_lamports"))
             .and_then(|v| v.as_integer())
-            .unwrap_or(0)
+            .filter(|v| *v > 0)
+            .unwrap_or(50_000_000) as u64;
+        if let Some(value) = catarnith::config::env_lookup("MAYHEM_LIVE_MAX_BALANCE_LAMPORTS") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                live_max_balance_lamports = parsed;
+            }
+        }
+        let live_max_balance_sol =
+            format!("{:.4}", live_max_balance_lamports as f64 / 1_000_000_000.0);
+        let mut sell_slippage_bps = live_table
+            .and_then(|t| t.get("sell_slippage_bps"))
+            .and_then(|v| v.as_integer())
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| slippage_bps.clone());
+        sell_slippage_bps = catarnith::config::env_lookup("MAYHEM_LIVE_SELL_SLIPPAGE_BPS")
+            .unwrap_or(sell_slippage_bps);
+        let mut priority_fee_microlamports = live_table
+            .and_then(|t| t.get("compute_unit_price_microlamports"))
+            .and_then(|v| v.as_integer())
+            .unwrap_or(100_000)
             .to_string();
-        let stop_loss_bps = table
-            .get("stop_loss_bps")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(0)
-            .to_string();
-        let max_open_positions = table
-            .get("max_open_positions")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(1)
-            .to_string();
-        let daily_loss_lamports = table
-            .get("max_daily_loss_lamports")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(0);
-        let daily_loss_sol = format!("{:.4}", daily_loss_lamports as f64 / 1_000_000_000.0);
-        let pair_scope = table
-            .get("pair_scope")
+        priority_fee_microlamports =
+            catarnith::config::env_lookup("MAYHEM_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS")
+                .unwrap_or(priority_fee_microlamports);
+        let mut jito_block_engine_url = live_table
+            .and_then(|t| t.get("jito_block_engine_url"))
             .and_then(|v| v.as_str())
-            .map(PairScope::from_config_value)
-            .transpose()
-            .unwrap_or_else(|_| Some(PairScope::MayhemOnly))
-            .unwrap_or(PairScope::MayhemOnly);
+            .unwrap_or("")
+            .to_string();
+        jito_block_engine_url = catarnith::config::env_lookup("MAYHEM_LIVE_JITO_BLOCK_ENGINE_URL")
+            .unwrap_or(jito_block_engine_url);
+        let mut jito_tip_lamports = live_table
+            .and_then(|t| t.get("jito_tip_lamports"))
+            .and_then(|v| v.as_integer())
+            .unwrap_or(100_000)
+            .to_string();
+        jito_tip_lamports = catarnith::config::env_lookup("MAYHEM_LIVE_JITO_TIP_LAMPORTS")
+            .unwrap_or(jito_tip_lamports);
+        let mut confirmation_poll_ms = live_table
+            .and_then(|t| t.get("confirmation_poll_ms"))
+            .and_then(|v| v.as_integer())
+            .unwrap_or(200)
+            .to_string();
+        confirmation_poll_ms = catarnith::config::env_lookup("MAYHEM_LIVE_CONFIRMATION_POLL_MS")
+            .unwrap_or(confirmation_poll_ms);
+        let mut pre_broadcast_simulation = live_table
+            .and_then(|t| t.get("pre_broadcast_simulation"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        pre_broadcast_simulation = env_bool_lookup(
+            "MAYHEM_LIVE_PRE_BROADCAST_SIMULATION",
+            pre_broadcast_simulation,
+        );
         (
             buy_size_sol,
             helius_key,
             slippage_bps,
             max_hold_secs,
-            mode,
-            take_profit_bps,
-            stop_loss_bps,
-            max_open_positions,
-            daily_loss_sol,
-            pair_scope,
+            enable_live_trading,
+            require_manual_live_unlock,
+            live_max_balance_sol,
+            sell_slippage_bps,
+            priority_fee_microlamports,
+            jito_block_engine_url,
+            jito_tip_lamports,
+            confirmation_poll_ms,
+            pre_broadcast_simulation,
         )
     };
     let fallback_rpc = catarnith::config::env_lookup("MAYHEM_FALLBACK_RPC_URL").unwrap_or_default();
@@ -2682,13 +2773,16 @@ async fn run_settings(
         s.settings.jupiter_key = jupiter_key;
         s.settings.slippage_bps = slippage_bps;
         s.settings.max_hold_secs = max_hold_secs;
-        s.settings.take_profit_bps = take_profit_bps;
-        s.settings.stop_loss_bps = stop_loss_bps;
-        s.settings.max_open_positions = max_open_positions;
-        s.settings.daily_loss_sol = daily_loss_sol;
         s.settings.theme = s.theme;
-        s.settings.mode = mode;
-        s.settings.pair_scope = pair_scope;
+        s.settings.enable_live_trading = enable_live_trading;
+        s.settings.require_manual_live_unlock = require_manual_live_unlock;
+        s.settings.live_max_balance_sol = live_max_balance_sol;
+        s.settings.sell_slippage_bps = sell_slippage_bps;
+        s.settings.priority_fee_microlamports = priority_fee_microlamports;
+        s.settings.jito_block_engine_url = jito_block_engine_url;
+        s.settings.jito_tip_lamports = jito_tip_lamports;
+        s.settings.confirmation_poll_ms = confirmation_poll_ms;
+        s.settings.pre_broadcast_simulation = pre_broadcast_simulation;
         if first_run {
             // Brand-new user: open with blank editable fields so they
             // enter their own wallet/keys/sizes from scratch instead
@@ -2699,10 +2793,6 @@ async fn run_settings(
             s.settings.jupiter_key.clear();
             s.settings.slippage_bps.clear();
             s.settings.max_hold_secs.clear();
-            s.settings.take_profit_bps.clear();
-            s.settings.stop_loss_bps.clear();
-            s.settings.max_open_positions.clear();
-            s.settings.daily_loss_sol.clear();
         }
         s.phase = Phase::Settings;
         let _ = event_tx.send(ScanEvent::StateChanged);
@@ -2726,22 +2816,19 @@ async fn run_settings(
                 s.settings.error = None;
                 s.settings.saved = false;
                 match s.settings.active_field {
-                    // Theme cycles through its three palettes; Mode
-                    // toggles Paper/Live. Direction doesn't matter
-                    // for a two-value toggle.
                     SettingsField::Theme => s.settings.theme = s.settings.theme.cycle(),
-                    SettingsField::Mode => {
-                        s.settings.mode = match s.settings.mode {
-                            Mode::Paper => Mode::Live,
-                            Mode::Live => Mode::Paper,
-                        };
-                    }
-                    SettingsField::PairScope => {
-                        s.settings.pair_scope = s.settings.pair_scope.cycle();
-                    }
-                    // ←/→ on the advanced row expands/collapses it.
                     SettingsField::AdvancedToggle => {
                         s.settings.show_advanced = !s.settings.show_advanced;
+                    }
+                    SettingsField::EnableLiveTrading => {
+                        s.settings.enable_live_trading = !s.settings.enable_live_trading;
+                    }
+                    SettingsField::RequireManualLiveUnlock => {
+                        s.settings.require_manual_live_unlock =
+                            !s.settings.require_manual_live_unlock;
+                    }
+                    SettingsField::PreBroadcastSimulation => {
+                        s.settings.pre_broadcast_simulation = !s.settings.pre_broadcast_simulation;
                     }
                     // Left/Right on a text field is a no-op.
                     _ => {}
@@ -2759,15 +2846,18 @@ async fn run_settings(
                     SettingsField::JupiterKey => s.settings.jupiter_key.push(c),
                     SettingsField::SlippageBps => s.settings.slippage_bps.push(c),
                     SettingsField::MaxHoldSecs => s.settings.max_hold_secs.push(c),
-                    SettingsField::TakeProfitBps => s.settings.take_profit_bps.push(c),
-                    SettingsField::StopLossBps => s.settings.stop_loss_bps.push(c),
-                    SettingsField::MaxOpenPositions => s.settings.max_open_positions.push(c),
-                    SettingsField::DailyLossSol => s.settings.daily_loss_sol.push(c),
+                    SettingsField::LiveMaxBalanceSol => s.settings.live_max_balance_sol.push(c),
+                    SettingsField::SellSlippageBps => s.settings.sell_slippage_bps.push(c),
+                    SettingsField::PriorityFee => s.settings.priority_fee_microlamports.push(c),
+                    SettingsField::JitoUrl => s.settings.jito_block_engine_url.push(c),
+                    SettingsField::JitoTipLamports => s.settings.jito_tip_lamports.push(c),
+                    SettingsField::ConfirmationPollMs => s.settings.confirmation_poll_ms.push(c),
                     // Selector fields are changed with ←/→, not typing.
                     SettingsField::Theme
-                    | SettingsField::Mode
-                    | SettingsField::PairScope
-                    | SettingsField::AdvancedToggle => {}
+                    | SettingsField::AdvancedToggle
+                    | SettingsField::EnableLiveTrading
+                    | SettingsField::RequireManualLiveUnlock
+                    | SettingsField::PreBroadcastSimulation => {}
                 }
             }
             Some(ScanCommand::Backspace) => {
@@ -2796,23 +2886,30 @@ async fn run_settings(
                     SettingsField::MaxHoldSecs => {
                         s.settings.max_hold_secs.pop();
                     }
-                    SettingsField::TakeProfitBps => {
-                        s.settings.take_profit_bps.pop();
+                    SettingsField::LiveMaxBalanceSol => {
+                        s.settings.live_max_balance_sol.pop();
                     }
-                    SettingsField::StopLossBps => {
-                        s.settings.stop_loss_bps.pop();
+                    SettingsField::SellSlippageBps => {
+                        s.settings.sell_slippage_bps.pop();
                     }
-                    SettingsField::MaxOpenPositions => {
-                        s.settings.max_open_positions.pop();
+                    SettingsField::PriorityFee => {
+                        s.settings.priority_fee_microlamports.pop();
                     }
-                    SettingsField::DailyLossSol => {
-                        s.settings.daily_loss_sol.pop();
+                    SettingsField::JitoUrl => {
+                        s.settings.jito_block_engine_url.pop();
+                    }
+                    SettingsField::JitoTipLamports => {
+                        s.settings.jito_tip_lamports.pop();
+                    }
+                    SettingsField::ConfirmationPollMs => {
+                        s.settings.confirmation_poll_ms.pop();
                     }
                     // Non-text fields ignore Backspace.
                     SettingsField::Theme
-                    | SettingsField::Mode
-                    | SettingsField::PairScope
-                    | SettingsField::AdvancedToggle => {}
+                    | SettingsField::AdvancedToggle
+                    | SettingsField::EnableLiveTrading
+                    | SettingsField::RequireManualLiveUnlock
+                    | SettingsField::PreBroadcastSimulation => {}
                 }
             }
             Some(ScanCommand::Start) => {
@@ -2826,13 +2923,16 @@ async fn run_settings(
                         jupiter_key: s.settings.jupiter_key.clone(),
                         slippage_bps: s.settings.slippage_bps.clone(),
                         max_hold_secs: s.settings.max_hold_secs.clone(),
-                        take_profit_bps: s.settings.take_profit_bps.clone(),
-                        stop_loss_bps: s.settings.stop_loss_bps.clone(),
-                        max_open_positions: s.settings.max_open_positions.clone(),
-                        daily_loss_sol: s.settings.daily_loss_sol.clone(),
                         theme: s.settings.theme,
-                        mode: s.settings.mode,
-                        pair_scope: s.settings.pair_scope,
+                        enable_live_trading: s.settings.enable_live_trading,
+                        require_manual_live_unlock: s.settings.require_manual_live_unlock,
+                        live_max_balance_sol: s.settings.live_max_balance_sol.clone(),
+                        sell_slippage_bps: s.settings.sell_slippage_bps.clone(),
+                        priority_fee_microlamports: s.settings.priority_fee_microlamports.clone(),
+                        jito_block_engine_url: s.settings.jito_block_engine_url.clone(),
+                        jito_tip_lamports: s.settings.jito_tip_lamports.clone(),
+                        confirmation_poll_ms: s.settings.confirmation_poll_ms.clone(),
+                        pre_broadcast_simulation: s.settings.pre_broadcast_simulation,
                     }
                 };
                 match save_settings(config_path, &vals) {
@@ -2872,13 +2972,16 @@ struct SettingsSnapshot {
     jupiter_key: String,
     slippage_bps: String,
     max_hold_secs: String,
-    take_profit_bps: String,
-    stop_loss_bps: String,
-    max_open_positions: String,
-    daily_loss_sol: String,
     theme: Theme,
-    mode: Mode,
-    pair_scope: PairScope,
+    enable_live_trading: bool,
+    require_manual_live_unlock: bool,
+    live_max_balance_sol: String,
+    sell_slippage_bps: String,
+    priority_fee_microlamports: String,
+    jito_block_engine_url: String,
+    jito_tip_lamports: String,
+    confirmation_poll_ms: String,
+    pre_broadcast_simulation: bool,
 }
 
 /// Persist wallet key (optional) and buy size to the active config
@@ -2932,42 +3035,62 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
         bail!("max hold must be greater than 0 seconds");
     }
 
-    // Advanced risk fields. Take-profit / stop-loss are in bps and may
-    // be 0 (disabled). Max open positions must be >= 1. Daily loss is
-    // entered in SOL and stored as lamports; 0 means "no daily cap".
-    let take_profit_bps: i64 = vals
-        .take_profit_bps
+    let live_max_balance_sol: f64 = vals
+        .live_max_balance_sol
         .trim()
         .parse()
-        .context("take profit is not a valid integer (bps)")?;
-    if take_profit_bps < 0 {
-        bail!("take profit cannot be negative");
+        .context("live max balance is not a valid SOL number")?;
+    if live_max_balance_sol <= 0.0 {
+        bail!("live max balance must be positive");
     }
-    let stop_loss_bps: i64 = vals
-        .stop_loss_bps
+    let live_max_balance_lamports = (live_max_balance_sol * 1_000_000_000.0).round() as u64;
+    if live_max_balance_lamports == 0 {
+        bail!("live max balance is too small");
+    }
+
+    let sell_slippage_bps: u32 = vals
+        .sell_slippage_bps
         .trim()
         .parse()
-        .context("stop loss is not a valid integer (bps)")?;
-    if stop_loss_bps < 0 {
-        bail!("stop loss cannot be negative");
+        .context("sell slippage is not a valid integer (bps)")?;
+    if sell_slippage_bps == 0 {
+        bail!("sell slippage must be greater than 0 bps");
     }
-    let max_open_positions: i64 = vals
-        .max_open_positions
+    if sell_slippage_bps >= 10_000 {
+        bail!("sell slippage must be below 10000 bps (100%)");
+    }
+
+    let priority_fee_microlamports: u64 = vals
+        .priority_fee_microlamports
         .trim()
         .parse()
-        .context("max open positions is not a valid integer")?;
-    if max_open_positions < 1 {
-        bail!("max open positions must be at least 1");
+        .context("priority fee is not a valid integer (micro-lamports)")?;
+    if priority_fee_microlamports == 0 {
+        bail!("priority fee must be greater than 0 micro-lamports");
     }
-    let daily_loss_sol: f64 = vals
-        .daily_loss_sol
+
+    let jito_block_engine_url = vals.jito_block_engine_url.trim();
+    if !jito_block_engine_url.is_empty()
+        && !(jito_block_engine_url.starts_with("https://")
+            || jito_block_engine_url.starts_with("http://"))
+    {
+        bail!("jito url must start with https:// or http://");
+    }
+
+    let jito_tip_lamports: u64 = vals
+        .jito_tip_lamports
         .trim()
         .parse()
-        .context("daily loss limit is not a valid SOL number")?;
-    if daily_loss_sol < 0.0 {
-        bail!("daily loss limit cannot be negative");
+        .context("jito tip is not a valid integer (lamports)")?;
+
+    let confirmation_poll_ms: u64 = vals
+        .confirmation_poll_ms
+        .trim()
+        .parse()
+        .context("confirmation poll is not a valid integer (ms)")?;
+    if confirmation_poll_ms == 0 {
+        bail!("confirmation poll must be greater than 0 ms");
     }
-    let daily_loss_lamports = (daily_loss_sol * 1_000_000_000.0).round() as i64;
 
     let helius_key = vals.helius_key.trim();
 
@@ -3002,33 +3125,52 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
         "max_hold_seconds".to_string(),
         toml::Value::Integer(max_hold_secs),
     );
-    // Advanced risk knobs.
     table.insert(
-        "take_profit_bps".to_string(),
-        toml::Value::Integer(take_profit_bps),
+        "enable_live_trading".to_string(),
+        toml::Value::Boolean(vals.enable_live_trading),
     );
     table.insert(
-        "stop_loss_bps".to_string(),
-        toml::Value::Integer(stop_loss_bps),
+        "require_manual_live_unlock".to_string(),
+        toml::Value::Boolean(vals.require_manual_live_unlock),
     );
-    table.insert(
-        "max_open_positions".to_string(),
-        toml::Value::Integer(max_open_positions),
+
+    let live_value = table
+        .entry("live".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let live_table = live_value
+        .as_table_mut()
+        .context("[live] config section must be a table")?;
+    live_table.insert(
+        "max_balance_lamports".to_string(),
+        toml::Value::Integer(live_max_balance_lamports as i64),
     );
-    table.insert(
-        "max_daily_loss_lamports".to_string(),
-        toml::Value::Integer(daily_loss_lamports),
+    live_table.insert(
+        "sell_slippage_bps".to_string(),
+        toml::Value::Integer(sell_slippage_bps as i64),
     );
-    // Write mode only; deliberately do NOT auto-flip enable_live_trading so
-    // selecting "live" can't silently arm live trading. The saved message
-    // reminds the operator that live also needs enable_live_trading=true.
-    table.insert(
-        "mode".to_string(),
-        toml::Value::String(vals.mode.as_str().to_string()),
+    live_table.insert(
+        "compute_unit_price_microlamports".to_string(),
+        toml::Value::Integer(priority_fee_microlamports as i64),
     );
-    table.insert(
-        "pair_scope".to_string(),
-        toml::Value::String(vals.pair_scope.as_str().to_string()),
+    if jito_block_engine_url.is_empty() {
+        live_table.remove("jito_block_engine_url");
+    } else {
+        live_table.insert(
+            "jito_block_engine_url".to_string(),
+            toml::Value::String(jito_block_engine_url.to_string()),
+        );
+    }
+    live_table.insert(
+        "jito_tip_lamports".to_string(),
+        toml::Value::Integer(jito_tip_lamports as i64),
+    );
+    live_table.insert(
+        "confirmation_poll_ms".to_string(),
+        toml::Value::Integer(confirmation_poll_ms as i64),
+    );
+    live_table.insert(
+        "pre_broadcast_simulation".to_string(),
+        toml::Value::Boolean(vals.pre_broadcast_simulation),
     );
 
     let out = toml::to_string(&table).context("serialize updated config")?;
@@ -3055,23 +3197,30 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
         vals.jupiter_key.trim(),
         slippage_bps,
         max_hold_secs,
-        vals.pair_scope,
+        vals.enable_live_trading,
+        vals.require_manual_live_unlock,
+        live_max_balance_lamports,
+        sell_slippage_bps,
+        priority_fee_microlamports,
+        jito_block_engine_url,
+        jito_tip_lamports,
+        confirmation_poll_ms,
+        vals.pre_broadcast_simulation,
     )
     .unwrap_or(None);
 
-    let live_hint = if vals.mode == Mode::Live {
-        "  (live also needs enable_live_trading=true)"
+    let live_gate = if vals.enable_live_trading && !vals.require_manual_live_unlock {
+        "live gates armed"
+    } else if vals.enable_live_trading {
+        "live enabled but manual unlock is still locked"
     } else {
-        ""
+        "live disabled"
     };
     Ok(format!(
-        "saved base_buy_lamports={lamports} slippage_bps={slippage_bps} max_hold_s={max_hold_secs} tp_bps={take_profit_bps} sl_bps={stop_loss_bps} max_open={max_open_positions} daily_loss_lamports={daily_loss_lamports} mode={} pair_scope={} to {config_path:?}{}{}",
-        vals.mode.as_str(),
-        vals.pair_scope.as_str(),
+        "saved base_buy_lamports={lamports} slippage_bps={slippage_bps} max_hold_s={max_hold_secs} live_max_balance_lamports={live_max_balance_lamports} sell_slippage_bps={sell_slippage_bps} priority_fee={priority_fee_microlamports} jito_tip={jito_tip_lamports} confirmation_poll_ms={confirmation_poll_ms} ({live_gate}) to {config_path:?}{}",
         env_note
             .map(|p| format!(" and {p:?}"))
             .unwrap_or_default(),
-        live_hint,
     ))
 }
 
@@ -3090,7 +3239,15 @@ fn update_env_file(
     jupiter_key: &str,
     slippage_bps: u32,
     max_hold_secs: i64,
-    pair_scope: PairScope,
+    enable_live_trading: bool,
+    require_manual_live_unlock: bool,
+    live_max_balance_lamports: u64,
+    sell_slippage_bps: u32,
+    priority_fee_microlamports: u64,
+    jito_block_engine_url: &str,
+    jito_tip_lamports: u64,
+    confirmation_poll_ms: u64,
+    pre_broadcast_simulation: bool,
 ) -> Result<Option<String>> {
     use anyhow::Context;
 
@@ -3123,42 +3280,55 @@ fn update_env_file(
     // Secret values are skipped when empty so we never blank an existing key.
     let helius_opt = (!helius_key.is_empty()).then_some(helius_key);
     let jupiter_opt = (!jupiter_key.is_empty()).then_some(jupiter_key);
+    let env_values = vec![
+        ("LIVE_BASE_BUY_LAMPORTS", lamports.to_string()),
+        ("FALLBACK_RPC_URL", fallback_rpc.to_string()),
+        ("LIVE_MAX_SLIPPAGE_BPS", slippage_bps.to_string()),
+        ("LIVE_MAX_HOLD_SECONDS", max_hold_secs.to_string()),
+        ("LIVE_ENABLE_LIVE_TRADING", enable_live_trading.to_string()),
+        (
+            "LIVE_REQUIRE_MANUAL_LIVE_UNLOCK",
+            require_manual_live_unlock.to_string(),
+        ),
+        (
+            "LIVE_MAX_BALANCE_LAMPORTS",
+            live_max_balance_lamports.to_string(),
+        ),
+        ("LIVE_SELL_SLIPPAGE_BPS", sell_slippage_bps.to_string()),
+        (
+            "LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS",
+            priority_fee_microlamports.to_string(),
+        ),
+        (
+            "LIVE_JITO_BLOCK_ENGINE_URL",
+            jito_block_engine_url.to_string(),
+        ),
+        ("LIVE_JITO_TIP_LAMPORTS", jito_tip_lamports.to_string()),
+        (
+            "LIVE_CONFIRMATION_POLL_MS",
+            confirmation_poll_ms.to_string(),
+        ),
+        (
+            "LIVE_PRE_BROADCAST_SIMULATION",
+            pre_broadcast_simulation.to_string(),
+        ),
+    ];
 
     let mut lines: Vec<String> = Vec::new();
-    let mut wrote_buy = false;
+    let mut wrote = vec![false; env_values.len()];
     let mut wrote_wallet = wallet_b58_opt.is_none();
     let mut wrote_helius = helius_opt.is_none();
-    let mut wrote_fallback = false;
     let mut wrote_jupiter = jupiter_opt.is_none();
-    let mut wrote_slippage = false;
-    let mut wrote_hold = false;
-    let mut wrote_pair_scope = false;
-    // Match either the canonical `CTARNITH_*` name or the legacy `MAYHEM_*`
-    // fallback on read, but always emit the canonical name so a legacy `.env`
-    // is migrated in place on the first save.
-    let matches_key = |trimmed: &str, suffix: &str| -> bool {
-        for prefix in ["CTARNITH_", "MAYHEM_"] {
-            for lead in ["export ", ""] {
-                if trimmed.starts_with(&format!("{lead}{prefix}{suffix}=")) {
-                    return true;
-                }
-            }
-        }
-        false
-    };
     for line in content.lines() {
         let trimmed = line.trim();
-        if matches_key(trimmed, "LIVE_BASE_BUY_LAMPORTS") {
-            lines.push(format!("export CTARNITH_LIVE_BASE_BUY_LAMPORTS={lamports}"));
-            wrote_buy = true;
-        } else if matches_key(trimmed, "WALLET_KEYPAIR_BASE58") {
+        if matches_env_suffix(trimmed, "WALLET_KEYPAIR_BASE58") {
             if let Some(w) = wallet_b58_opt {
                 lines.push(format!("export CTARNITH_WALLET_KEYPAIR_BASE58={w}"));
                 wrote_wallet = true;
             } else {
                 lines.push(line.to_string());
             }
-        } else if matches_key(trimmed, "WALLET_KEYPAIR_PATH") {
+        } else if matches_env_suffix(trimmed, "WALLET_KEYPAIR_PATH") {
             if wallet_b58_opt.is_some() {
                 lines.push(format!("# {line}  # disabled by catarnith settings editor"));
             } else {
@@ -3173,9 +3343,14 @@ fn update_env_file(
             } else {
                 lines.push(line.to_string());
             }
-        } else if matches_key(trimmed, "FALLBACK_RPC_URL") {
+        } else if matches_env_suffix(trimmed, "FALLBACK_RPC_URL") {
             lines.push(format!("export CTARNITH_FALLBACK_RPC_URL={fallback_rpc}"));
-            wrote_fallback = true;
+            if let Some(idx) = env_values
+                .iter()
+                .position(|(suffix, _)| *suffix == "FALLBACK_RPC_URL")
+            {
+                wrote[idx] = true;
+            }
         } else if trimmed.starts_with("export JUP_API_KEY=") || trimmed.starts_with("JUP_API_KEY=")
         {
             if let Some(k) = jupiter_opt {
@@ -3184,28 +3359,21 @@ fn update_env_file(
             } else {
                 lines.push(line.to_string());
             }
-        } else if matches_key(trimmed, "LIVE_MAX_SLIPPAGE_BPS") {
-            lines.push(format!(
-                "export CTARNITH_LIVE_MAX_SLIPPAGE_BPS={slippage_bps}"
-            ));
-            wrote_slippage = true;
-        } else if matches_key(trimmed, "LIVE_MAX_HOLD_SECONDS") {
-            lines.push(format!(
-                "export CTARNITH_LIVE_MAX_HOLD_SECONDS={max_hold_secs}"
-            ));
-            wrote_hold = true;
-        } else if matches_key(trimmed, "PAIR_SCOPE") {
-            lines.push(format!(
-                "export CTARNITH_PAIR_SCOPE={}",
-                pair_scope.as_str()
-            ));
-            wrote_pair_scope = true;
         } else {
-            lines.push(line.to_string());
+            let mut replacement: Option<(usize, String)> = None;
+            for (idx, (suffix, value)) in env_values.iter().enumerate() {
+                if matches_env_suffix(trimmed, suffix) {
+                    replacement = Some((idx, format!("export CTARNITH_{suffix}={value}")));
+                    break;
+                }
+            }
+            if let Some((idx, line)) = replacement {
+                lines.push(line);
+                wrote[idx] = true;
+            } else {
+                lines.push(line.to_string());
+            }
         }
-    }
-    if !wrote_buy {
-        lines.push(format!("export CTARNITH_LIVE_BASE_BUY_LAMPORTS={lamports}"));
     }
     if let Some(w) = wallet_b58_opt {
         if !wrote_wallet {
@@ -3217,29 +3385,15 @@ fn update_env_file(
             lines.push(format!("export HELIUS_API_KEY={k}"));
         }
     }
-    if !wrote_fallback {
-        lines.push(format!("export CTARNITH_FALLBACK_RPC_URL={fallback_rpc}"));
-    }
     if let Some(k) = jupiter_opt {
         if !wrote_jupiter {
             lines.push(format!("export JUP_API_KEY={k}"));
         }
     }
-    if !wrote_slippage {
-        lines.push(format!(
-            "export CTARNITH_LIVE_MAX_SLIPPAGE_BPS={slippage_bps}"
-        ));
-    }
-    if !wrote_hold {
-        lines.push(format!(
-            "export CTARNITH_LIVE_MAX_HOLD_SECONDS={max_hold_secs}"
-        ));
-    }
-    if !wrote_pair_scope {
-        lines.push(format!(
-            "export CTARNITH_PAIR_SCOPE={}",
-            pair_scope.as_str()
-        ));
+    for (idx, (suffix, value)) in env_values.iter().enumerate() {
+        if !wrote[idx] {
+            lines.push(format!("export CTARNITH_{suffix}={value}"));
+        }
     }
 
     let mut out = lines.join("\n");
@@ -4405,6 +4559,24 @@ mod panic_recovery_tests {
             super::interpret_key(key('S'), super::Phase::ModePicker),
             Some(super::ScanCommand::PickSettings)
         ));
+    }
+
+    #[tokio::test]
+    async fn picker_live_forces_live_validation_for_explicit_config() {
+        let mut cfg = super::Config::default();
+        cfg.mode = super::Mode::Paper;
+        cfg.helius_api_key = "test-key".to_string();
+        cfg.enable_live_trading = false;
+        cfg.require_manual_live_unlock = false;
+
+        let err = super::resolve_trade_config(&cfg, super::Mode::Live, true)
+            .await
+            .expect_err("picker Live must force live validation even for explicit configs");
+
+        assert!(
+            err.to_string().contains("live"),
+            "expected a live validation error, got {err:#}"
+        );
     }
 
     #[test]

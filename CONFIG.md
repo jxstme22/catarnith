@@ -7,12 +7,15 @@ cp config.example.toml config.toml
 cp .env.example .env
 ```
 
-`config.toml` holds strategy, paper/live mode, and risk settings. `.env` holds
-local secrets and machine-specific overrides. Both files are ignored by git.
+`config.toml` holds strategy, direct-run defaults, and risk settings. `.env`
+holds local secrets and machine-specific overrides. Both files are ignored by
+git.
 
 No alternate runtime profiles are shipped anymore. Paper, live, and auto-bot
 mode all load `config.toml` unless you explicitly pass `--config <PATH>` or set
-`CTARNITH_LIVE_CONFIG`.
+`CTARNITH_LIVE_CONFIG`. Inside the TUI, the mode picker overrides `mode` for
+that run: `[2] Live Trade` forces live execution and `[3] Paper Trade` forces
+paper-only execution.
 
 ## Precedence
 
@@ -33,16 +36,19 @@ Examples:
 - `CTARNITH_WALLET_KEYPAIR_BASE58` wins over `wallet_keypair_path`.
 
 The in-app Settings editor writes both `config.toml` and the matching `.env`
-keys so saved values are not accidentally shadowed by stale overrides.
+keys so saved values are not accidentally shadowed by stale overrides. Settings
+edits wallet/secrets, buy size, buy slippage, max hold, and advanced live-trade
+controls. Auto Bot Setup (`[1]`) owns bot mode, pair scope, stream timing, and
+bot-specific advanced controls.
 
 ## Main Keys
 
 | Key | Meaning |
 |---|---|
-| `mode` | `"paper"` or `"live"`. Paper is the safe default. |
+| `mode` | `"paper"` or `"live"` default for direct non-picker runs. The TUI picker overrides this for Live/Paper trade mode. |
 | `helius_api_key` | Helius key, or set `HELIUS_API_KEY` in `.env`. |
 | `wallet_keypair_path` | Dedicated live hot-wallet JSON path. |
-| `pair_scope` | `"mayhem_only"` or `"all_pumpfun"`. |
+| `pair_scope` | `"mayhem_only"` or `"all_pumpfun"`. Edited from Auto Bot Setup. |
 | `base_buy_lamports` | Buy size in lamports. |
 | `max_open_positions` | Concurrent position cap. |
 | `max_total_lamports_per_mint` | Per-mint exposure cap. |
@@ -67,7 +73,7 @@ keys, but env overrides still work.
 | `[live]` key | Env override | Meaning |
 |---|---|---|
 | `compute_unit_limit` | `CTARNITH_LIVE_COMPUTE_UNIT_LIMIT` | Compute units per trade transaction. |
-| `compute_unit_price_microlamports` | `CTARNITH_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS` | Priority fee. |
+| `compute_unit_price_microlamports` | `CTARNITH_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS` | Priority fee. Editable from Settings advanced. |
 | `send_max_retries` | `CTARNITH_LIVE_SEND_MAX_RETRIES` | RPC send retries. |
 | `send_timeout_ms` | `CTARNITH_LIVE_SEND_TIMEOUT_MS` | Per-RPC send timeout. |
 | `rpc_timeout_ms` | `CTARNITH_LIVE_RPC_TIMEOUT_MS` | General RPC timeout. |
@@ -78,16 +84,17 @@ keys, but env overrides still work.
 | `settlement_commitment` | `CTARNITH_LIVE_SETTLEMENT_COMMITMENT` | `processed`, `confirmed`, or `finalized`. |
 | `sell_slippage_bps` | `CTARNITH_LIVE_SELL_SLIPPAGE_BPS` | Sell slippage; omit to reuse `max_slippage_bps`. |
 | `max_balance_lamports` | `CTARNITH_LIVE_MAX_BALANCE_LAMPORTS` | Refuse to trade above this wallet balance. |
-| `jito_block_engine_url` | `CTARNITH_LIVE_JITO_BLOCK_ENGINE_URL` | Optional Jito panic-sell path. |
+| `jito_block_engine_url` | `CTARNITH_LIVE_JITO_BLOCK_ENGINE_URL` | Optional Jito block-engine broadcast path. Editable from Settings advanced. |
 | `jito_tip_account` | `CTARNITH_LIVE_JITO_TIP_ACCOUNT` | Jito tip account. |
-| `jito_tip_lamports` | `CTARNITH_LIVE_JITO_TIP_LAMPORTS` | Jito tip amount. |
+| `jito_tip_lamports` | `CTARNITH_LIVE_JITO_TIP_LAMPORTS` | Jito tip amount. Editable from Settings advanced. |
 | `jupiter_timeout_ms` | `CTARNITH_LIVE_JUPITER_TIMEOUT_MS` | Jupiter sell-fallback timeout. |
 
 ## Arming Live
 
 To allow live broadcast, set all of the following deliberately:
 
-1. `mode = "live"`
+1. Select `[2] Live Trade` in the TUI picker, or set `mode = "live"` for direct
+   `catarnith scan`/bot runs.
 2. `enable_live_trading = true`
 3. `require_manual_live_unlock = false`
 4. `wallet_keypair_path` to a dedicated hot-wallet file outside the repo, or

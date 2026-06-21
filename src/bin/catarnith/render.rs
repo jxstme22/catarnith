@@ -354,8 +354,11 @@ fn render_mode_picker(frame: &mut Frame, area: Rect, state: &ScanState, palette:
         palette.bg_art_dim,
     );
 
-    let config_name =
-        catarnith::config::env_lookup("MAYHEM_LIVE_CONFIG").unwrap_or_else(|| "config.toml".into());
+    let config_name = if state.config_label.trim().is_empty() {
+        "config.toml"
+    } else {
+        state.config_label.as_str()
+    };
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::raw("")),
@@ -489,7 +492,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
         frame,
         area,
         64,
-        24,
+        30,
         " SETTINGS ",
         palette.panel,
         palette.bg_art_dim,
@@ -513,8 +516,8 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
             format!("  {label}")
         }
     };
-    // Selector fields (Theme/Mode) wrap their value in chevrons when
-    // focused so it reads as a left/right toggle.
+    // Selector fields wrap their value in chevrons when focused so
+    // they read as left/right toggles.
     let selector = |field: SettingsField, value: &str| -> String {
         if active == field {
             format!("‹ {value} ›")
@@ -522,6 +525,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
             value.to_string()
         }
     };
+    let bool_label = |value: bool| if value { "on" } else { "off" };
 
     // Mask secrets the same way the wallet field is masked.
     let masked = |s: &str| -> String {
@@ -599,14 +603,6 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
         ]),
         Line::from(vec![
             Span::styled(
-                marker(SettingsField::MaxHoldSecs, "MAX HOLD     "),
-                label_style(SettingsField::MaxHoldSecs),
-            ),
-            Span::styled(st.max_hold_secs.clone(), Style::default().fg(palette.fg)),
-            Span::styled(" sec", Style::default().fg(palette.muted)),
-        ]),
-        Line::from(vec![
-            Span::styled(
                 marker(SettingsField::Theme, "THEME        "),
                 label_style(SettingsField::Theme),
             ),
@@ -615,40 +611,14 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
                 Style::default().fg(palette.fg),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                marker(SettingsField::Mode, "MODE         "),
-                label_style(SettingsField::Mode),
-            ),
-            Span::styled(
-                selector(
-                    SettingsField::Mode,
-                    match st.mode {
-                        catarnith::types::Mode::Paper => "Paper",
-                        catarnith::types::Mode::Live => "Live",
-                    },
-                ),
-                Style::default().fg(palette.fg),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                marker(SettingsField::PairScope, "PAIR SCOPE   "),
-                label_style(SettingsField::PairScope),
-            ),
-            Span::styled(
-                selector(SettingsField::PairScope, st.pair_scope.label()),
-                Style::default().fg(palette.fg),
-            ),
-        ]),
     ];
 
-    // Advanced risk section: a toggle row plus four risk fields that
-    // only render when expanded. ←/→ on the toggle flips show_advanced.
+    // Advanced live section: a toggle row plus live-execution controls
+    // that only render when expanded. ←/→ on the toggle flips it.
     let toggle_label = if st.show_advanced {
-        "▾ ADVANCED RISK"
+        "▾ ADVANCED LIVE"
     } else {
-        "▸ ADVANCED RISK"
+        "▸ ADVANCED LIVE"
     };
     lines.push(Line::from(Span::raw("")));
     lines.push(Line::from(vec![
@@ -671,44 +641,130 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
     if st.show_advanced {
         lines.push(Line::from(vec![
             Span::styled(
-                marker(SettingsField::TakeProfitBps, "  TAKE PROFIT "),
-                label_style(SettingsField::TakeProfitBps),
+                marker(SettingsField::EnableLiveTrading, "  LIVE ENABLE"),
+                label_style(SettingsField::EnableLiveTrading),
             ),
-            Span::styled(st.take_profit_bps.clone(), Style::default().fg(palette.fg)),
-            Span::styled(" bps", Style::default().fg(palette.muted)),
-        ]));
-        lines.push(Line::from(vec![
+            Span::raw(" "),
             Span::styled(
-                marker(SettingsField::StopLossBps, "  STOP LOSS   "),
-                label_style(SettingsField::StopLossBps),
-            ),
-            Span::styled(st.stop_loss_bps.clone(), Style::default().fg(palette.fg)),
-            Span::styled(" bps", Style::default().fg(palette.muted)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled(
-                marker(SettingsField::MaxOpenPositions, "  MAX OPEN    "),
-                label_style(SettingsField::MaxOpenPositions),
-            ),
-            Span::styled(
-                st.max_open_positions.clone(),
+                selector(
+                    SettingsField::EnableLiveTrading,
+                    bool_label(st.enable_live_trading),
+                ),
                 Style::default().fg(palette.fg),
             ),
-            Span::styled(" positions", Style::default().fg(palette.muted)),
         ]));
         lines.push(Line::from(vec![
             Span::styled(
-                marker(SettingsField::DailyLossSol, "  DAILY LOSS  "),
-                label_style(SettingsField::DailyLossSol),
+                marker(SettingsField::RequireManualLiveUnlock, "  LIVE LOCK  "),
+                label_style(SettingsField::RequireManualLiveUnlock),
             ),
-            Span::styled(st.daily_loss_sol.clone(), Style::default().fg(palette.fg)),
+            Span::styled(
+                selector(
+                    SettingsField::RequireManualLiveUnlock,
+                    if st.require_manual_live_unlock {
+                        "locked"
+                    } else {
+                        "unlocked"
+                    },
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::LiveMaxBalanceSol, "  MAX BALANCE"),
+                label_style(SettingsField::LiveMaxBalanceSol),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                st.live_max_balance_sol.clone(),
+                Style::default().fg(palette.fg),
+            ),
             Span::styled(" SOL", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::MaxHoldSecs, "  MAX HOLD   "),
+                label_style(SettingsField::MaxHoldSecs),
+            ),
+            Span::styled(st.max_hold_secs.clone(), Style::default().fg(palette.fg)),
+            Span::styled(" sec", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::SellSlippageBps, "  SELL SLIP  "),
+                label_style(SettingsField::SellSlippageBps),
+            ),
+            Span::styled(
+                st.sell_slippage_bps.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" bps", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::PriorityFee, "  PRIORITY   "),
+                label_style(SettingsField::PriorityFee),
+            ),
+            Span::styled(
+                st.priority_fee_microlamports.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" µ-lamports", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::JitoUrl, "  JITO URL   "),
+                label_style(SettingsField::JitoUrl),
+            ),
+            Span::styled(
+                truncate_line(
+                    &plain(&st.jito_block_engine_url),
+                    inner.width.saturating_sub(17) as usize,
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::JitoTipLamports, "  JITO TIP   "),
+                label_style(SettingsField::JitoTipLamports),
+            ),
+            Span::styled(
+                st.jito_tip_lamports.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" lamports", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::ConfirmationPollMs, "  CONFIRM    "),
+                label_style(SettingsField::ConfirmationPollMs),
+            ),
+            Span::styled(
+                st.confirmation_poll_ms.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" ms", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(SettingsField::PreBroadcastSimulation, "  SIMULATE   "),
+                label_style(SettingsField::PreBroadcastSimulation),
+            ),
+            Span::styled(
+                selector(
+                    SettingsField::PreBroadcastSimulation,
+                    bool_label(st.pre_broadcast_simulation),
+                ),
+                Style::default().fg(palette.fg),
+            ),
         ]));
     }
 
     lines.push(Line::from(Span::raw("")));
     lines.push(Line::from(Span::styled(
-        "secrets masked · ←/→ changes selectors & expands advanced",
+        "secrets masked · mode is selected from the picker",
         Style::default().fg(palette.muted),
     )));
 
@@ -1849,6 +1905,10 @@ mod tests {
         state.settings.fallback_rpc = "https://rpc.example".into();
         state.settings.slippage_bps = "1500".into();
         state.settings.max_hold_secs = "1".into();
+        state.settings.live_max_balance_sol = "0.0500".into();
+        state.settings.sell_slippage_bps = "1500".into();
+        state.settings.confirmation_poll_ms = "200".into();
+        state.settings.show_advanced = true;
         state.settings.active_field = SettingsField::SlippageBps;
         terminal
             .draw(|frame| render(frame, &state))
@@ -1865,6 +1925,22 @@ mod tests {
         assert!(!text.contains("jupkey"), "jupiter key must be masked");
         assert!(text.contains("SLIPPAGE"), "slippage row should render");
         assert!(text.contains("MAX HOLD"), "max hold row should render");
+        assert!(
+            text.contains("LIVE ENABLE"),
+            "advanced live controls should render"
+        );
+        assert!(
+            text.contains("MAX BALANCE"),
+            "live max balance should render"
+        );
+        assert!(
+            !text.contains("PAIR SCOPE"),
+            "pair scope belongs to Auto Bot setup"
+        );
+        assert!(
+            !text.contains("MODE         "),
+            "mode belongs to the picker, not Settings"
+        );
     }
 
     #[test]
