@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use catarnith::{
-    config::{Config, TOKEN_2022_PROGRAM},
+    config::{Config, Market},
     executor::Order,
     journal::{Journal, JournalKind},
     types::{now_ms, BuyOrder, ExecutionReport, ExecutionStatus, Mode, SellOrder},
@@ -197,9 +197,15 @@ async fn main() -> Result<()> {
         .get_balance(&user)
         .await
         .context("fetch live SOL balance before send")?;
-    let max_balance = env_u64("MAYHEM_LIVE_MAX_BALANCE_LAMPORTS", DEFAULT_MAX_BALANCE)?;
+    let max_balance = env_sol_lamports(
+        "MAYHEM_LIVE_MAX_BALANCE_SOL",
+        env_u64("MAYHEM_LIVE_MAX_BALANCE_LAMPORTS", DEFAULT_MAX_BALANCE)?,
+    )?;
     if pre_sol > max_balance {
-        bail!("live wallet balance exceeds CTARNITH_LIVE_MAX_BALANCE_LAMPORTS={max_balance}");
+        bail!(
+            "live wallet balance exceeds CTARNITH_LIVE_MAX_BALANCE_SOL={:.4}",
+            max_balance as f64 / 1_000_000_000.0
+        );
     }
 
     let built = build_trade(&cfg, state_rpc.clone(), &keypair, user, mint, args.side).await?;
@@ -357,16 +363,14 @@ async fn build_trade(
     if bonding_curve.complete {
         bail!("bonding curve is complete; PumpSwap execution is not implemented");
     }
-    if cfg.require_curve_mayhem_flag && !bonding_curve.is_mayhem_mode {
+    if require_mayhem_curve_flag(cfg) && !bonding_curve.is_mayhem_mode {
         bail!("refusing live execution because the on-chain curve is not Mayhem mode");
     }
     if bonding_curve.quote_mint != Pubkey::default() {
-        bail!("only native-SOL Mayhem curves are supported by the live canary");
+        bail!("only native-SOL Pump.fun bonding curves are supported by live execution");
     }
     let mint_account = rpc.get_account(&mint).await.context("fetch mint account")?;
-    if mint_account.owner.to_string() != TOKEN_2022_PROGRAM {
-        bail!("Mayhem live canary currently supports Token-2022 mints only");
-    }
+    let base_token_program = live_base_token_program(mint_account.owner)?;
 
     let supply = rpc
         .get_token_supply(&mint)
@@ -375,8 +379,7 @@ async fn build_trade(
         .amount
         .parse::<u64>()
         .context("parse mint supply")?;
-    let token_account =
-        pda::associated_token(&user, &constants::SPL_TOKEN_2022_PROGRAM_ID, &mint).0;
+    let token_account = pda::associated_token(&user, &base_token_program, &mint).0;
 
     let (instructions, instruction_name, input, quote, protected, slippage_bps) = match side {
         Side::Buy => {
@@ -396,7 +399,7 @@ async fn build_trade(
                     &global,
                     &bonding_curve,
                     mint,
-                    constants::SPL_TOKEN_PROGRAM_ID,
+                    base_token_program,
                     user,
                     spend,
                     protected,
@@ -437,7 +440,7 @@ async fn build_trade(
                     &global,
                     &bonding_curve,
                     mint,
-                    constants::SPL_TOKEN_PROGRAM_ID,
+                    base_token_program,
                     user,
                     amount,
                     protected,
@@ -551,7 +554,7 @@ async fn wait_for_confirmation(
             } else {
                 primary_empty_polls = primary_empty_polls.saturating_add(1);
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                let probe_fallback = primary_empty_polls % 3 == 0
+                let probe_fallback = primary_empty_polls.is_multiple_of(3)
                     || last_error.is_some()
                     || remaining
                         <= poll
@@ -777,7 +780,7 @@ fn validate_live_profile(cfg: &Config) -> Result<()> {
 fn validate_runtime_unlocks(cfg: &Config) -> Result<()> {
     // Live arming is config-driven: enable_live_trading=true and
     // require_manual_live_unlock=false. The protective gates (wallet
-    // outside the repo, chmod 600 secrets, distinct paid fallback RPC,
+    // outside the repo, chmod 600 secrets, optional distinct paid fallback RPC,
     // max-balance cap) are enforced separately and are not relaxed here.
     if !cfg.enable_live_trading {
         bail!("live trading is locked: set enable_live_trading=true after paper validation");
@@ -850,6 +853,20 @@ fn apply_slippage_floor(value: u64, slippage_bps: u32) -> Result<u64> {
     u64::try_from(protected.max(1)).context("protected output exceeds u64")
 }
 
+fn require_mayhem_curve_flag(cfg: &Config) -> bool {
+    cfg.require_curve_mayhem_flag && cfg.market == Market::MayhemOnly
+}
+
+fn live_base_token_program(owner: Pubkey) -> Result<Pubkey> {
+    if owner == constants::SPL_TOKEN_PROGRAM_ID || owner == constants::SPL_TOKEN_2022_PROGRAM_ID {
+        Ok(owner)
+    } else {
+        bail!(
+            "live execution supports SPL Token or Token-2022 Pump.fun mints only; mint owner={owner}"
+        );
+    }
+}
+
 fn env_u32(name: &str, default: u32) -> Result<u32> {
     match catarnith::config::env_lookup(name) {
         Some(value) => value
@@ -864,6 +881,21 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
         Some(value) => value
             .parse::<u64>()
             .with_context(|| format!("{name} must be an unsigned integer")),
+        None => Ok(default),
+    }
+}
+
+fn env_sol_lamports(name: &str, default: u64) -> Result<u64> {
+    match catarnith::config::env_lookup(name) {
+        Some(value) => {
+            let sol = value
+                .parse::<f64>()
+                .with_context(|| format!("{name} must be a SOL number"))?;
+            if !sol.is_finite() || sol < 0.0 {
+                bail!("{name} must be a non-negative SOL number");
+            }
+            Ok((sol * 1_000_000_000.0).round() as u64)
+        }
         None => Ok(default),
     }
 }
@@ -1071,6 +1103,35 @@ mod tests {
         assert_eq!(apply_slippage_floor(1, 1_000).unwrap(), 1);
         assert!(apply_slippage_floor(0, 100).is_err());
         assert!(apply_slippage_floor(1_000, 10_000).is_err());
+    }
+
+    #[test]
+    fn mayhem_curve_flag_is_required_only_for_mayhem_market() {
+        let mut cfg = Config {
+            require_curve_mayhem_flag: true,
+            market: Market::MayhemOnly,
+            ..Config::default()
+        };
+        assert!(require_mayhem_curve_flag(&cfg));
+
+        cfg.market = Market::NonMayhemOnly;
+        assert!(!require_mayhem_curve_flag(&cfg));
+
+        cfg.market = Market::AllPumpfun;
+        assert!(!require_mayhem_curve_flag(&cfg));
+    }
+
+    #[test]
+    fn live_base_token_program_accepts_spl_and_token_2022() {
+        assert_eq!(
+            live_base_token_program(constants::SPL_TOKEN_PROGRAM_ID).unwrap(),
+            constants::SPL_TOKEN_PROGRAM_ID
+        );
+        assert_eq!(
+            live_base_token_program(constants::SPL_TOKEN_2022_PROGRAM_ID).unwrap(),
+            constants::SPL_TOKEN_2022_PROGRAM_ID
+        );
+        assert!(live_base_token_program(Pubkey::new_unique()).is_err());
     }
 
     #[test]

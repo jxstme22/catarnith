@@ -1,6 +1,7 @@
 use crate::types::Mode;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use solana_pubkey::Pubkey;
 use std::{env, fs, path::Path};
 
 /// Load `.env`-style files into the current process's
@@ -183,48 +184,51 @@ pub const DEFAULT_LIVE_MAX_HOLD_SECONDS: i64 = 4;
 pub const DEFAULT_LIVE_MAX_UNPRICED_EXIT_GRACE_MS: i64 = 0;
 pub const DEFAULT_LIVE_MAX_EXIT_CHECK_INTERVAL_MS: u64 = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum PairScope {
+pub enum Market {
+    #[default]
     MayhemOnly,
+    NonMayhemOnly,
     AllPumpfun,
 }
 
-impl Default for PairScope {
-    fn default() -> Self {
-        Self::MayhemOnly
-    }
-}
-
-impl PairScope {
+impl Market {
     pub fn as_str(self) -> &'static str {
         match self {
-            PairScope::MayhemOnly => "mayhem_only",
-            PairScope::AllPumpfun => "all_pumpfun",
+            Market::MayhemOnly => "mayhem_only",
+            Market::NonMayhemOnly => "non_mayhem_only",
+            Market::AllPumpfun => "all_pumpfun",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            PairScope::MayhemOnly => "Mayhem only",
-            PairScope::AllPumpfun => "All Pump.fun",
+            Market::MayhemOnly => "Mayhem only",
+            Market::NonMayhemOnly => "Non-Mayhem only",
+            Market::AllPumpfun => "All Pump.fun",
         }
     }
 
     pub fn cycle(self) -> Self {
         match self {
-            PairScope::MayhemOnly => PairScope::AllPumpfun,
-            PairScope::AllPumpfun => PairScope::MayhemOnly,
+            Market::MayhemOnly => Market::NonMayhemOnly,
+            Market::NonMayhemOnly => Market::AllPumpfun,
+            Market::AllPumpfun => Market::MayhemOnly,
         }
     }
 
     pub fn from_config_value(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "mayhem" | "mayhem_only" | "mayhem-only" => Ok(PairScope::MayhemOnly),
+            "mayhem" | "mayhem_only" | "mayhem-only" => Ok(Market::MayhemOnly),
+            "non_mayhem" | "non_mayhem_only" | "non-mayhem" | "non-mayhem-only" | "not_mayhem"
+            | "not-mayhem" => Ok(Market::NonMayhemOnly),
             "all" | "all_pumpfun" | "all-pumpfun" | "pumpfun" | "pump.fun" => {
-                Ok(PairScope::AllPumpfun)
+                Ok(Market::AllPumpfun)
             }
-            other => anyhow::bail!("pair_scope must be mayhem_only or all_pumpfun, got {other:?}"),
+            other => anyhow::bail!(
+                "market must be mayhem_only, non_mayhem_only, or all_pumpfun, got {other:?}"
+            ),
         }
     }
 }
@@ -251,6 +255,11 @@ impl LiveRiskEnvelope {
             "MAYHEM_LIVE_BASE_BUY_LAMPORTS",
             &mut envelope.max_entry_lamports,
         )?;
+        env_envelope_sol_lamports(
+            "MAYHEM_LIVE_MAX_ENTRY_SOL",
+            "MAYHEM_LIVE_BASE_BUY_SOL",
+            &mut envelope.max_entry_lamports,
+        )?;
         env_envelope_usize(
             "MAYHEM_LIVE_MAX_OPEN_POSITIONS_CEILING",
             "MAYHEM_LIVE_MAX_OPEN_POSITIONS",
@@ -261,9 +270,19 @@ impl LiveRiskEnvelope {
             "MAYHEM_LIVE_MAX_TOTAL_OPEN_LAMPORTS",
             &mut envelope.max_total_open_lamports,
         )?;
+        env_envelope_sol_lamports(
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL_CEILING",
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL",
+            &mut envelope.max_total_open_lamports,
+        )?;
         env_envelope_i64(
             "MAYHEM_LIVE_MAX_DAILY_LOSS_CEILING_LAMPORTS",
             "MAYHEM_LIVE_MAX_DAILY_LOSS_LAMPORTS",
+            &mut envelope.max_daily_loss_lamports,
+        )?;
+        env_envelope_sol_lamports_i64(
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_SOL_CEILING",
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_SOL",
             &mut envelope.max_daily_loss_lamports,
         )?;
         env_envelope_u32(
@@ -417,6 +436,102 @@ impl Default for LiveConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyTradeSizing {
+    /// Use `base_buy_lamports` for every copied buy.
+    #[default]
+    Fixed,
+    /// Use the source wallet's observed buy size, capped by
+    /// `copy_trade_max_buy_lamports`.
+    Mirror,
+    /// Use observed buy size multiplied by `copy_trade_scale_bps`, capped by
+    /// `copy_trade_max_buy_lamports`.
+    Scaled,
+}
+
+impl CopyTradeSizing {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CopyTradeSizing::Fixed => "fixed",
+            CopyTradeSizing::Mirror => "mirror",
+            CopyTradeSizing::Scaled => "scaled",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CopyTradeSizing::Fixed => "Fixed",
+            CopyTradeSizing::Mirror => "Mirror",
+            CopyTradeSizing::Scaled => "Scaled",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            CopyTradeSizing::Fixed => CopyTradeSizing::Mirror,
+            CopyTradeSizing::Mirror => CopyTradeSizing::Scaled,
+            CopyTradeSizing::Scaled => CopyTradeSizing::Fixed,
+        }
+    }
+
+    pub fn from_config_value(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "fixed" => Ok(CopyTradeSizing::Fixed),
+            "mirror" => Ok(CopyTradeSizing::Mirror),
+            "scaled" | "scale" => Ok(CopyTradeSizing::Scaled),
+            other => {
+                anyhow::bail!("copy_trade_sizing must be fixed, mirror, or scaled, got {other:?}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyTradeBuyPolicy {
+    /// Copy only the first qualifying source buy for a mint.
+    #[default]
+    FirstOnly,
+    /// Keep copying later source buys until copy/risk caps stop entries.
+    Accumulate,
+}
+
+impl CopyTradeBuyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CopyTradeBuyPolicy::FirstOnly => "first_only",
+            CopyTradeBuyPolicy::Accumulate => "accumulate",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CopyTradeBuyPolicy::FirstOnly => "First only",
+            CopyTradeBuyPolicy::Accumulate => "Accumulate",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            CopyTradeBuyPolicy::FirstOnly => CopyTradeBuyPolicy::Accumulate,
+            CopyTradeBuyPolicy::Accumulate => CopyTradeBuyPolicy::FirstOnly,
+        }
+    }
+
+    pub fn from_config_value(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "first" | "first_only" | "first-only" | "once" => Ok(CopyTradeBuyPolicy::FirstOnly),
+            "accumulate" | "keep_buying" | "keep-buying" | "dca" => {
+                Ok(CopyTradeBuyPolicy::Accumulate)
+            }
+            other => anyhow::bail!(
+                "copy_trade_buy_policy must be first_only or accumulate, got {other:?}"
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -437,7 +552,8 @@ pub struct Config {
     pub token_2022_program: String,
     pub axiom_route_program: String,
     pub axiom_jito_marker: String,
-    pub pair_scope: PairScope,
+    #[serde(alias = "pair_scope")]
+    pub market: Market,
     pub require_mayhem_evidence: bool,
     pub allow_indirect_mayhem_candidates: bool,
     pub require_route_confirmation: bool,
@@ -512,6 +628,21 @@ pub struct Config {
     pub backfill_limit: usize,
     pub watched_wallets: Vec<String>,
     pub target_wallet: Option<String>,
+    pub copy_trade_enabled: bool,
+    pub copy_trade_wallet: String,
+    pub copy_trade_sizing: CopyTradeSizing,
+    pub copy_trade_scale_bps: u32,
+    pub copy_trade_max_buy_lamports: u64,
+    pub copy_trade_buy_policy: CopyTradeBuyPolicy,
+    pub copy_trade_max_buys_per_mint: u32,
+    pub copy_trade_min_source_buy_lamports: u64,
+    pub copy_trade_max_hold_seconds: i64,
+    pub copy_trade_take_profit_bps: i64,
+    pub copy_trade_take_profit_sell_bps: u32,
+    pub copy_trade_stop_loss_bps: i64,
+    pub copy_trade_follow_sells: bool,
+    pub copy_trade_allow_pumpswap: bool,
+    pub bot_keep_alive: bool,
 
     pub journal_dir: String,
     pub sqlite_path: String,
@@ -536,7 +667,7 @@ impl Default for Config {
             token_2022_program: TOKEN_2022_PROGRAM.to_string(),
             axiom_route_program: AXIOM_ROUTE_PROGRAM.to_string(),
             axiom_jito_marker: AXIOM_JITO_MARKER.to_string(),
-            pair_scope: PairScope::MayhemOnly,
+            market: Market::MayhemOnly,
             require_mayhem_evidence: true,
             allow_indirect_mayhem_candidates: false,
             require_route_confirmation: true,
@@ -608,8 +739,23 @@ impl Default for Config {
             backfill_limit: 0,
             watched_wallets: Vec::new(),
             target_wallet: None,
+            copy_trade_enabled: false,
+            copy_trade_wallet: String::new(),
+            copy_trade_sizing: CopyTradeSizing::Fixed,
+            copy_trade_scale_bps: 10_000,
+            copy_trade_max_buy_lamports: 13_025_001,
+            copy_trade_buy_policy: CopyTradeBuyPolicy::FirstOnly,
+            copy_trade_max_buys_per_mint: 1,
+            copy_trade_min_source_buy_lamports: 0,
+            copy_trade_max_hold_seconds: 180,
+            copy_trade_take_profit_bps: 8_000,
+            copy_trade_take_profit_sell_bps: 10_000,
+            copy_trade_stop_loss_bps: 3_500,
+            copy_trade_follow_sells: true,
+            copy_trade_allow_pumpswap: false,
+            bot_keep_alive: true,
             journal_dir: "journals".to_string(),
-            sqlite_path: "journals/mayhem.sqlite".to_string(),
+            sqlite_path: "journals/catarnith.sqlite".to_string(),
             paper_report_path: String::new(),
             horizon_report_path: String::new(),
             live: LiveConfig::default(),
@@ -635,6 +781,8 @@ impl Config {
             .with_context(|| format!("failed to read config at {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("failed to parse TOML at {}", path.display()))?;
+        apply_sol_toml_aliases(&raw, &mut cfg)
+            .with_context(|| format!("failed to apply SOL aliases from {}", path.display()))?;
         if apply_env_overrides {
             let mut helius_key = String::new();
             if let Ok(api_key) = env::var("HELIUS_API_KEY") {
@@ -683,10 +831,8 @@ impl Config {
                     cfg.wallet_keypair_base58 = Some(wallet_b58.trim().to_string());
                 }
             }
-            if let Ok(pair_scope) = env_var("CTARNITH_PAIR_SCOPE", "MAYHEM_PAIR_SCOPE") {
-                if !pair_scope.trim().is_empty() {
-                    cfg.pair_scope = PairScope::from_config_value(pair_scope.trim())?;
-                }
+            if let Some(market) = market_env_override()? {
+                cfg.market = market;
             }
             // Last-ditch: if neither env var set the keypair
             // source and the config's field is empty, look for
@@ -710,15 +856,31 @@ impl Config {
             }
             cfg.apply_live_env_overrides()?;
         }
+        cfg.normalize();
         Ok(cfg)
     }
 
     pub fn apply_runtime_mode(&mut self, mode: Mode) -> Result<()> {
         self.mode = mode;
-        self.apply_live_env_overrides()
+        self.apply_live_env_overrides()?;
+        self.normalize();
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        if self
+            .target_wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.trim().is_empty())
+        {
+            self.target_wallet = None;
+        }
+        self.watched_wallets
+            .retain(|wallet| !wallet.trim().is_empty());
     }
 
     fn apply_live_env_overrides(&mut self) -> Result<()> {
+        self.apply_copy_trade_env_overrides()?;
         if self.mode != Mode::Live {
             return Ok(());
         }
@@ -740,15 +902,11 @@ impl Config {
             &mut self.axiom_route_program,
         );
         env_override_string("MAYHEM_LIVE_AXIOM_JITO_MARKER", &mut self.axiom_jito_marker);
-        if let Ok(pair_scope) = env_var("CTARNITH_PAIR_SCOPE", "MAYHEM_PAIR_SCOPE") {
-            if !pair_scope.trim().is_empty() {
-                self.pair_scope = PairScope::from_config_value(pair_scope.trim())?;
-            }
+        if let Some(market) = market_env_override()? {
+            self.market = market;
         }
-        if let Some(pair_scope) = env_lookup("MAYHEM_LIVE_PAIR_SCOPE") {
-            if !pair_scope.trim().is_empty() {
-                self.pair_scope = PairScope::from_config_value(pair_scope.trim())?;
-            }
+        if let Some(market) = live_market_env_override()? {
+            self.market = market;
         }
         env_override_string(
             "MAYHEM_LIVE_MAYHEM_MINT_ALLOWLIST_PATH",
@@ -840,8 +998,16 @@ impl Config {
             "MAYHEM_LIVE_MIN_OBSERVED_BUY_LAMPORTS",
             &mut self.min_observed_buy_lamports,
         )?;
+        env_override_sol_lamports(
+            "MAYHEM_LIVE_MIN_OBSERVED_BUY_SOL",
+            &mut self.min_observed_buy_lamports,
+        )?;
         env_override_option_u64(
             "MAYHEM_LIVE_MAX_OBSERVED_BUY_LAMPORTS",
+            &mut self.max_observed_buy_lamports,
+        )?;
+        env_override_option_sol_lamports(
+            "MAYHEM_LIVE_MAX_OBSERVED_BUY_SOL",
             &mut self.max_observed_buy_lamports,
         )?;
         env_override_option_u64(
@@ -854,6 +1020,7 @@ impl Config {
         )?;
 
         env_override_u64("MAYHEM_LIVE_BASE_BUY_LAMPORTS", &mut self.base_buy_lamports)?;
+        env_override_sol_lamports("MAYHEM_LIVE_BASE_BUY_SOL", &mut self.base_buy_lamports)?;
         env_override_usize(
             "MAYHEM_LIVE_MAX_OPEN_POSITIONS",
             &mut self.max_open_positions,
@@ -863,12 +1030,24 @@ impl Config {
             "MAYHEM_LIVE_MAX_TOTAL_LAMPORTS_PER_MINT",
             &mut self.max_total_lamports_per_mint,
         )?;
+        env_override_sol_lamports(
+            "MAYHEM_LIVE_MAX_TOTAL_SOL_PER_MINT",
+            &mut self.max_total_lamports_per_mint,
+        )?;
         env_override_u64(
             "MAYHEM_LIVE_MAX_TOTAL_OPEN_LAMPORTS",
             &mut self.max_total_open_lamports,
         )?;
+        env_override_sol_lamports(
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL",
+            &mut self.max_total_open_lamports,
+        )?;
         env_override_i64(
             "MAYHEM_LIVE_MAX_DAILY_LOSS_LAMPORTS",
+            &mut self.max_daily_loss_lamports,
+        )?;
+        env_override_sol_lamports_i64(
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_SOL",
             &mut self.max_daily_loss_lamports,
         )?;
         env_override_u32(
@@ -990,6 +1169,70 @@ impl Config {
         Ok(())
     }
 
+    fn apply_copy_trade_env_overrides(&mut self) -> Result<()> {
+        env_override_bool(
+            "MAYHEM_LIVE_COPY_TRADE_ENABLED",
+            &mut self.copy_trade_enabled,
+        )?;
+        env_override_string("MAYHEM_LIVE_COPY_TRADE_WALLET", &mut self.copy_trade_wallet);
+        if let Some(value) = env_lookup("MAYHEM_LIVE_COPY_TRADE_SIZING") {
+            self.copy_trade_sizing = CopyTradeSizing::from_config_value(&value)?;
+        }
+        env_override_u32(
+            "MAYHEM_LIVE_COPY_TRADE_SCALE_BPS",
+            &mut self.copy_trade_scale_bps,
+        )?;
+        env_override_u64(
+            "MAYHEM_LIVE_COPY_TRADE_MAX_BUY_LAMPORTS",
+            &mut self.copy_trade_max_buy_lamports,
+        )?;
+        env_override_sol_lamports(
+            "MAYHEM_LIVE_COPY_TRADE_MAX_BUY_SOL",
+            &mut self.copy_trade_max_buy_lamports,
+        )?;
+        if let Some(value) = env_lookup("MAYHEM_LIVE_COPY_TRADE_BUY_POLICY") {
+            self.copy_trade_buy_policy = CopyTradeBuyPolicy::from_config_value(&value)?;
+        }
+        env_override_u32(
+            "MAYHEM_LIVE_COPY_TRADE_MAX_BUYS_PER_MINT",
+            &mut self.copy_trade_max_buys_per_mint,
+        )?;
+        env_override_u64(
+            "MAYHEM_LIVE_COPY_TRADE_MIN_SOURCE_BUY_LAMPORTS",
+            &mut self.copy_trade_min_source_buy_lamports,
+        )?;
+        env_override_sol_lamports(
+            "MAYHEM_LIVE_COPY_TRADE_MIN_SOURCE_BUY_SOL",
+            &mut self.copy_trade_min_source_buy_lamports,
+        )?;
+        env_override_i64(
+            "MAYHEM_LIVE_COPY_TRADE_MAX_HOLD_SECONDS",
+            &mut self.copy_trade_max_hold_seconds,
+        )?;
+        env_override_i64(
+            "MAYHEM_LIVE_COPY_TRADE_TAKE_PROFIT_BPS",
+            &mut self.copy_trade_take_profit_bps,
+        )?;
+        env_override_u32(
+            "MAYHEM_LIVE_COPY_TRADE_TAKE_PROFIT_SELL_BPS",
+            &mut self.copy_trade_take_profit_sell_bps,
+        )?;
+        env_override_i64(
+            "MAYHEM_LIVE_COPY_TRADE_STOP_LOSS_BPS",
+            &mut self.copy_trade_stop_loss_bps,
+        )?;
+        env_override_bool(
+            "MAYHEM_LIVE_COPY_TRADE_FOLLOW_SELLS",
+            &mut self.copy_trade_follow_sells,
+        )?;
+        env_override_bool(
+            "MAYHEM_LIVE_COPY_TRADE_ALLOW_PUMPSWAP",
+            &mut self.copy_trade_allow_pumpswap,
+        )?;
+        env_override_bool("MAYHEM_LIVE_BOT_KEEP_ALIVE", &mut self.bot_keep_alive)?;
+        Ok(())
+    }
+
     pub fn validate_live_risk_envelope(&self, label: &str) -> Result<()> {
         let envelope = LiveRiskEnvelope::from_env()?;
         // All ceiling comparisons are advisory: the operator's explicit
@@ -999,9 +1242,9 @@ impl Config {
         // it in the log panel.
         if self.base_buy_lamports > envelope.max_entry_lamports {
             tracing::warn!(
-                "{label} base_buy_lamports={} exceeds MAYHEM_LIVE_MAX_ENTRY_LAMPORTS={} (non-blocking)",
-                self.base_buy_lamports,
-                envelope.max_entry_lamports
+                "{label} base_buy_sol={:.9} exceeds CTARNITH_LIVE_MAX_ENTRY_SOL={:.9} (non-blocking)",
+                self.base_buy_lamports as f64 / 1_000_000_000.0,
+                envelope.max_entry_lamports as f64 / 1_000_000_000.0
             );
         }
         if self.max_open_positions > envelope.max_open_positions {
@@ -1013,16 +1256,16 @@ impl Config {
         }
         if self.max_total_open_lamports > envelope.max_total_open_lamports {
             tracing::warn!(
-                "{label} max_total_open_lamports={} exceeds MAYHEM_LIVE_MAX_TOTAL_OPEN_LAMPORTS_CEILING={} (non-blocking)",
-                self.max_total_open_lamports,
-                envelope.max_total_open_lamports
+                "{label} max_total_open_sol={:.9} exceeds CTARNITH_LIVE_MAX_TOTAL_OPEN_SOL_CEILING={:.9} (non-blocking)",
+                self.max_total_open_lamports as f64 / 1_000_000_000.0,
+                envelope.max_total_open_lamports as f64 / 1_000_000_000.0
             );
         }
         if self.max_daily_loss_lamports > envelope.max_daily_loss_lamports {
             tracing::warn!(
-                "{label} max_daily_loss_lamports={} exceeds MAYHEM_LIVE_MAX_DAILY_LOSS_CEILING_LAMPORTS={} (non-blocking)",
-                self.max_daily_loss_lamports,
-                envelope.max_daily_loss_lamports
+                "{label} max_daily_loss_sol={:.9} exceeds CTARNITH_LIVE_MAX_DAILY_LOSS_SOL_CEILING={:.9} (non-blocking)",
+                self.max_daily_loss_lamports as f64 / 1_000_000_000.0,
+                envelope.max_daily_loss_lamports as f64 / 1_000_000_000.0
             );
         }
         if self.max_slippage_bps > envelope.max_slippage_bps {
@@ -1115,12 +1358,10 @@ impl Config {
                 anyhow::bail!("live mode refuses unlimited or missing risk caps");
             }
             if self.max_total_lamports_per_mint < self.base_buy_lamports {
-                anyhow::bail!(
-                    "live mode requires max_total_lamports_per_mint >= base_buy_lamports"
-                );
+                anyhow::bail!("live mode requires max_total_sol_per_mint >= base_buy_sol");
             }
             if self.max_total_open_lamports < self.base_buy_lamports {
-                anyhow::bail!("live mode requires max_total_open_lamports >= base_buy_lamports");
+                anyhow::bail!("live mode requires max_total_open_sol >= base_buy_sol");
             }
             if self.live_single_lifecycle {
                 if self.max_open_positions != 1 {
@@ -1131,7 +1372,7 @@ impl Config {
                 }
                 if self.max_total_open_lamports > self.max_total_lamports_per_mint {
                     anyhow::bail!(
-                        "live_single_lifecycle requires max_total_open_lamports <= max_total_lamports_per_mint"
+                        "live_single_lifecycle requires max_total_open_sol <= max_total_sol_per_mint"
                     );
                 }
                 if self.enable_take_profit_exit && self.take_profit_sell_bps != 10_000 {
@@ -1209,6 +1450,41 @@ impl Config {
         if self.use_observed_entry_fill && !self.fetch_full_transaction {
             anyhow::bail!("use_observed_entry_fill requires fetch_full_transaction=true");
         }
+        if self.copy_trade_enabled {
+            let wallet = self.copy_trade_wallet.trim();
+            if wallet.is_empty() {
+                anyhow::bail!("copy_trade_enabled requires copy_trade_wallet");
+            }
+            wallet
+                .parse::<Pubkey>()
+                .with_context(|| "copy_trade_wallet is not a valid Solana pubkey")?;
+            if !self.fetch_full_transaction {
+                anyhow::bail!("copy_trade_enabled requires fetch_full_transaction=true");
+            }
+            if self.copy_trade_scale_bps == 0 {
+                anyhow::bail!("copy_trade_scale_bps must be positive");
+            }
+            if self.copy_trade_max_buy_lamports == 0 {
+                anyhow::bail!("copy_trade_max_buy_sol must be positive");
+            }
+            if self.copy_trade_max_buys_per_mint == 0 {
+                anyhow::bail!("copy_trade_max_buys_per_mint must be positive");
+            }
+            if self.copy_trade_max_hold_seconds <= 0 {
+                anyhow::bail!("copy_trade_max_hold_seconds must be positive");
+            }
+            if self.copy_trade_take_profit_bps < 0 {
+                anyhow::bail!("copy_trade_take_profit_bps cannot be negative");
+            }
+            if self.copy_trade_take_profit_sell_bps == 0
+                || self.copy_trade_take_profit_sell_bps > 10_000
+            {
+                anyhow::bail!("copy_trade_take_profit_sell_bps must be between 1 and 10000");
+            }
+            if self.copy_trade_stop_loss_bps < 0 {
+                anyhow::bail!("copy_trade_stop_loss_bps cannot be negative");
+            }
+        }
         if self.mode == Mode::Live && self.use_observed_entry_fill {
             anyhow::bail!("use_observed_entry_fill is a paper-only execution model");
         }
@@ -1216,7 +1492,7 @@ impl Config {
             .max_observed_buy_lamports
             .is_some_and(|max| self.min_observed_buy_lamports > max)
         {
-            anyhow::bail!("min_observed_buy_lamports cannot exceed max_observed_buy_lamports");
+            anyhow::bail!("min_observed_buy_sol cannot exceed max_observed_buy_sol");
         }
         if self.max_hold_seconds <= 0 {
             anyhow::bail!("max_hold_seconds must be positive");
@@ -1261,7 +1537,17 @@ impl Config {
                 wallets.push(wallet.clone());
             }
         }
+        if let Some(wallet) = self.copy_trade_wallet() {
+            if !wallets.iter().any(|w| w == wallet) {
+                wallets.push(wallet.to_string());
+            }
+        }
         wallets
+    }
+
+    pub fn copy_trade_wallet(&self) -> Option<&str> {
+        let wallet = self.copy_trade_wallet.trim();
+        (self.copy_trade_enabled && !wallet.is_empty()).then_some(wallet)
     }
 
     pub fn redacted(&self) -> serde_json::Value {
@@ -1364,6 +1650,110 @@ fn display_env_name(name: &str) -> String {
     canonical_env_name(name).unwrap_or_else(|| name.to_string())
 }
 
+fn apply_sol_toml_aliases(raw: &str, cfg: &mut Config) -> Result<()> {
+    let value: toml::Value = raw.parse().context("parse TOML for SOL aliases")?;
+    let Some(table) = value.as_table() else {
+        return Ok(());
+    };
+
+    apply_top_level_sol_alias(table, "base_buy_sol", &mut cfg.base_buy_lamports)?;
+    apply_top_level_sol_alias(
+        table,
+        "max_total_sol_per_mint",
+        &mut cfg.max_total_lamports_per_mint,
+    )?;
+    apply_top_level_sol_alias(
+        table,
+        "max_total_open_sol",
+        &mut cfg.max_total_open_lamports,
+    )?;
+    apply_top_level_sol_alias_i64(
+        table,
+        "max_daily_loss_sol",
+        &mut cfg.max_daily_loss_lamports,
+    )?;
+    apply_top_level_sol_alias(
+        table,
+        "copy_trade_max_buy_sol",
+        &mut cfg.copy_trade_max_buy_lamports,
+    )?;
+    apply_top_level_sol_alias(
+        table,
+        "copy_trade_min_source_buy_sol",
+        &mut cfg.copy_trade_min_source_buy_lamports,
+    )?;
+    apply_top_level_sol_alias(
+        table,
+        "min_observed_buy_sol",
+        &mut cfg.min_observed_buy_lamports,
+    )?;
+    apply_top_level_option_sol_alias(
+        table,
+        "max_observed_buy_sol",
+        &mut cfg.max_observed_buy_lamports,
+    )?;
+
+    if let Some(live) = table.get("live").and_then(toml::Value::as_table) {
+        apply_top_level_sol_alias(live, "max_balance_sol", &mut cfg.live.max_balance_lamports)?;
+        apply_top_level_sol_alias(live, "jito_tip_sol", &mut cfg.live.jito_tip_lamports)?;
+    }
+
+    Ok(())
+}
+
+fn apply_top_level_sol_alias(table: &toml::Table, key: &str, target: &mut u64) -> Result<()> {
+    if let Some(value) = table.get(key) {
+        *target = sol_value_to_lamports(value, key)?;
+    }
+    Ok(())
+}
+
+fn apply_top_level_option_sol_alias(
+    table: &toml::Table,
+    key: &str,
+    target: &mut Option<u64>,
+) -> Result<()> {
+    if let Some(value) = table.get(key) {
+        *target = Some(sol_value_to_lamports(value, key)?);
+    }
+    Ok(())
+}
+
+fn apply_top_level_sol_alias_i64(table: &toml::Table, key: &str, target: &mut i64) -> Result<()> {
+    if let Some(value) = table.get(key) {
+        *target = i64::try_from(sol_value_to_lamports(value, key)?)
+            .with_context(|| format!("{key} exceeds i64 lamports"))?;
+    }
+    Ok(())
+}
+
+fn sol_value_to_lamports(value: &toml::Value, name: &str) -> Result<u64> {
+    let sol = match value {
+        toml::Value::Float(value) => *value,
+        toml::Value::Integer(value) => *value as f64,
+        toml::Value::String(value) => value
+            .trim()
+            .parse::<f64>()
+            .with_context(|| format!("{name} must be a SOL number"))?,
+        _ => anyhow::bail!("{name} must be a SOL number"),
+    };
+    sol_f64_to_lamports(sol, name)
+}
+
+fn sol_f64_to_lamports(sol: f64, name: &str) -> Result<u64> {
+    if !sol.is_finite() || sol < 0.0 {
+        anyhow::bail!("{name} must be a non-negative SOL number");
+    }
+    if sol == 0.0 {
+        return Ok(0);
+    }
+    let lamports = (sol * 1_000_000_000.0).round();
+    if lamports < 1.0 || lamports > u64::MAX as f64 {
+        anyhow::bail!("{name} is outside supported lamport range");
+    }
+    Ok(lamports as u64)
+}
+
 /// Read an env var by its canonical name, falling back to a legacy name.
 /// Returns the trimmed value, or `VarError::NotPresent` when neither is set
 /// (or both are set but empty/whitespace).
@@ -1428,6 +1818,27 @@ where
         .transpose()
 }
 
+fn market_env_override() -> Result<Option<Market>> {
+    for (canonical, legacy) in [
+        ("CTARNITH_MARKET", "MAYHEM_MARKET"),
+        ("CTARNITH_PAIR_SCOPE", "MAYHEM_PAIR_SCOPE"),
+    ] {
+        if let Ok(value) = env_var(canonical, legacy) {
+            return Market::from_config_value(value.trim()).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn live_market_env_override() -> Result<Option<Market>> {
+    for legacy in ["MAYHEM_LIVE_MARKET", "MAYHEM_LIVE_PAIR_SCOPE"] {
+        if let Some(value) = env_lookup(legacy) {
+            return Market::from_config_value(value.trim()).map(Some);
+        }
+    }
+    Ok(None)
+}
+
 fn env_override_string(name: &str, target: &mut String) {
     if let Ok(Some(value)) = env_present_value(name) {
         *target = value;
@@ -1438,7 +1849,7 @@ fn env_override_option_string(name: &str, target: &mut Option<String>) -> Result
     if let Some(value) = env_present_value(name)? {
         if matches!(
             value.to_ascii_lowercase().as_str(),
-            "none" | "null" | "unset"
+            "" | "none" | "null" | "unset"
         ) {
             *target = None;
         } else {
@@ -1497,6 +1908,28 @@ fn env_override_u64(name: &str, target: &mut u64) -> Result<()> {
     Ok(())
 }
 
+fn env_override_sol_lamports(name: &str, target: &mut u64) -> Result<()> {
+    if let Some(value) = parse_env::<f64>(name)? {
+        *target = sol_f64_to_lamports(value, &display_env_name(name))?;
+    }
+    Ok(())
+}
+
+fn env_override_sol_lamports_i64(name: &str, target: &mut i64) -> Result<()> {
+    if let Some(value) = parse_env::<f64>(name)? {
+        *target = i64::try_from(sol_f64_to_lamports(value, &display_env_name(name))?)
+            .with_context(|| format!("{} exceeds i64 lamports", display_env_name(name)))?;
+    }
+    Ok(())
+}
+
+fn env_override_option_sol_lamports(name: &str, target: &mut Option<u64>) -> Result<()> {
+    if let Some(value) = parse_env::<f64>(name)? {
+        *target = Some(sol_f64_to_lamports(value, &display_env_name(name))?);
+    }
+    Ok(())
+}
+
 fn env_override_u32(name: &str, target: &mut u32) -> Result<()> {
     if let Some(value) = parse_env::<u32>(name)? {
         *target = value;
@@ -1527,6 +1960,44 @@ fn env_envelope_u64(envelope_name: &str, strategy_name: &str, target: &mut u64) 
     }
     if let Some(value) = parse_env::<u64>(strategy_name)? {
         *target = (*target).max(value);
+    }
+    Ok(())
+}
+
+fn env_envelope_sol_lamports(
+    envelope_name: &str,
+    strategy_name: &str,
+    target: &mut u64,
+) -> Result<()> {
+    if let Some(value) = parse_env::<f64>(envelope_name)? {
+        *target = sol_f64_to_lamports(value, &display_env_name(envelope_name))?;
+    }
+    if let Some(value) = parse_env::<f64>(strategy_name)? {
+        let strategy = sol_f64_to_lamports(value, &display_env_name(strategy_name))?;
+        *target = (*target).max(strategy);
+    }
+    Ok(())
+}
+
+fn env_envelope_sol_lamports_i64(
+    envelope_name: &str,
+    strategy_name: &str,
+    target: &mut i64,
+) -> Result<()> {
+    if let Some(value) = parse_env::<f64>(envelope_name)? {
+        *target = i64::try_from(sol_f64_to_lamports(
+            value,
+            &display_env_name(envelope_name),
+        )?)
+        .with_context(|| format!("{} exceeds i64 lamports", display_env_name(envelope_name)))?;
+    }
+    if let Some(value) = parse_env::<f64>(strategy_name)? {
+        let strategy = i64::try_from(sol_f64_to_lamports(
+            value,
+            &display_env_name(strategy_name),
+        )?)
+        .with_context(|| format!("{} exceeds i64 lamports", display_env_name(strategy_name)))?;
+        *target = (*target).max(strategy);
     }
     Ok(())
 }
@@ -1623,6 +2094,44 @@ mod tests {
 
         let envelope = LiveRiskEnvelope::from_env().expect("live envelope from env");
         assert_eq!(envelope.max_daily_loss_lamports, 1_000_000_000);
+    }
+
+    #[test]
+    fn live_envelope_supports_sol_sized_env_caps() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env test lock poisoned");
+        let keys = [
+            "MAYHEM_LIVE_MAX_ENTRY_LAMPORTS",
+            "MAYHEM_LIVE_BASE_BUY_LAMPORTS",
+            "MAYHEM_LIVE_MAX_ENTRY_SOL",
+            "MAYHEM_LIVE_BASE_BUY_SOL",
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_LAMPORTS_CEILING",
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_LAMPORTS",
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL_CEILING",
+            "MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL",
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_CEILING_LAMPORTS",
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_LAMPORTS",
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_SOL_CEILING",
+            "MAYHEM_LIVE_MAX_DAILY_LOSS_SOL",
+        ];
+        let _restore = EnvRestore::capture(&keys);
+        for key in keys {
+            env::remove_var(key);
+        }
+
+        env::set_var("MAYHEM_LIVE_MAX_ENTRY_SOL", "0.02");
+        env::set_var("MAYHEM_LIVE_BASE_BUY_SOL", "0.03");
+        env::set_var("MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL_CEILING", "0.2");
+        env::set_var("MAYHEM_LIVE_MAX_TOTAL_OPEN_SOL", "0.25");
+        env::set_var("MAYHEM_LIVE_MAX_DAILY_LOSS_SOL_CEILING", "0.4");
+        env::set_var("MAYHEM_LIVE_MAX_DAILY_LOSS_SOL", "0.45");
+
+        let envelope = LiveRiskEnvelope::from_env().expect("live envelope from SOL env");
+        assert_eq!(envelope.max_entry_lamports, 30_000_000);
+        assert_eq!(envelope.max_total_open_lamports, 250_000_000);
+        assert_eq!(envelope.max_daily_loss_lamports, 450_000_000);
     }
 
     #[test]

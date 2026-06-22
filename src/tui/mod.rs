@@ -122,17 +122,12 @@ pub struct TerminalState {
     pub theme: Theme,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Theme {
+    #[default]
     Neon,
     Amber,
     Mono,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::Neon
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

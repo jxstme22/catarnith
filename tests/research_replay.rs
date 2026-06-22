@@ -96,6 +96,8 @@ fn live_decoder_extracts_reference_wallet_market_fill() {
         .filter_map(serde_json::Value::as_str)
         .map(str::to_string)
         .collect();
+    let reference_wallet =
+        reference_wallet_from_market_fill(tx).expect("fixture should contain a market-fill owner");
     let decoded = decode_live_transaction(
         row.get("signature")
             .and_then(serde_json::Value::as_str)
@@ -106,7 +108,7 @@ fn live_decoder_extracts_reference_wallet_market_fill() {
             .expect("transaction should contain slot"),
         logs,
         Some(tx),
-        Some("8UbptT8bqtXVKvHkMwEkWqrRLQ5mTs2whQbY5Twfwhfi"),
+        Some(&reference_wallet),
     );
 
     assert_eq!(decoded.side, TradeSide::Buy);
@@ -163,4 +165,47 @@ fn reference_transactions_path() -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|path| path.exists())
+}
+
+fn reference_wallet_from_market_fill(tx: &serde_json::Value) -> Option<String> {
+    let mut balances = BTreeMap::<(String, String), (i128, i128)>::new();
+    collect_fixture_balances(tx, "/meta/preTokenBalances", true, &mut balances);
+    collect_fixture_balances(tx, "/meta/postTokenBalances", false, &mut balances);
+    balances
+        .into_iter()
+        .find_map(|((owner, mint), (pre, post))| {
+            (mint.ends_with("pump") && post > pre).then_some(owner)
+        })
+}
+
+fn collect_fixture_balances(
+    tx: &serde_json::Value,
+    pointer: &str,
+    is_pre: bool,
+    balances: &mut BTreeMap<(String, String), (i128, i128)>,
+) {
+    let Some(items) = tx.pointer(pointer).and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for item in items {
+        let Some(owner) = item.get("owner").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(mint) = item.get("mint").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let amount = item
+            .pointer("/uiTokenAmount/amount")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|amount| amount.parse::<i128>().ok())
+            .unwrap_or_default();
+        let entry = balances
+            .entry((owner.to_string(), mint.to_string()))
+            .or_default();
+        if is_pre {
+            entry.0 += amount;
+        } else {
+            entry.1 += amount;
+        }
+    }
 }

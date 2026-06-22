@@ -16,6 +16,7 @@ use catarnith::{
 };
 use std::sync::Arc;
 
+#[allow(clippy::large_enum_variant)]
 pub enum ScanExecutor {
     Live(LivePumpExecutor),
     Paper {

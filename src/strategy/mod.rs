@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, PairScope},
+    config::{Config, Market},
     types::{now_ms, Action, Decision, DecodedTx, Mode, TokenClassification, TradeSide},
 };
 use std::collections::HashMap;
@@ -7,12 +7,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct StrategySettings {
     pub mode: Mode,
+    pub market: Market,
     pub base_buy_lamports: u64,
     pub max_open_positions: usize,
     pub cooldown_seconds_per_mint: i64,
     pub burst_entry_seconds: i64,
     pub min_candidate_score: f64,
-    pub require_mayhem_evidence: bool,
     pub allow_indirect_mayhem_candidates: bool,
     pub require_route_confirmation: bool,
     pub require_reference_wallet_signal: bool,
@@ -30,13 +30,12 @@ impl From<&Config> for StrategySettings {
     fn from(config: &Config) -> Self {
         Self {
             mode: config.mode,
+            market: config.market,
             base_buy_lamports: config.base_buy_lamports,
             max_open_positions: config.max_open_positions,
             cooldown_seconds_per_mint: config.cooldown_seconds_per_mint,
             burst_entry_seconds: config.burst_entry_seconds,
             min_candidate_score: 0.45,
-            require_mayhem_evidence: config.require_mayhem_evidence
-                && config.pair_scope != PairScope::AllPumpfun,
             allow_indirect_mayhem_candidates: config.allow_indirect_mayhem_candidates,
             require_route_confirmation: config.require_route_confirmation,
             require_reference_wallet_signal: config.require_reference_wallet_signal,
@@ -151,6 +150,24 @@ impl BurstStrategy {
             };
         }
 
+        let mayhem_detected = classification.is_mayhem_candidate
+            || classification.is_mayhem_direct
+            || classification.has_verified_mayhem_evidence;
+        if settings.market == Market::NonMayhemOnly && mayhem_detected {
+            return Decision {
+                id,
+                timestamp_ms,
+                source_signature: Some(decoded.signature.clone()),
+                mint,
+                action: Action::Ignore,
+                mode: settings.mode,
+                reason_codes: vec!["non_mayhem_market_only".to_string()],
+                requested_lamports: None,
+                risk_approved: false,
+                risk_veto_reason: None,
+            };
+        }
+
         if settings.require_discovery_signal && !context.has_discovery_signal {
             return Decision {
                 id,
@@ -181,7 +198,9 @@ impl BurstStrategy {
             };
         }
 
-        if settings.require_fresh_mint_creation && !classification.is_fresh_launch {
+        let requires_fresh_entry_tx =
+            settings.require_fresh_mint_creation || settings.market == Market::NonMayhemOnly;
+        if requires_fresh_entry_tx && !classification.is_fresh_launch {
             return Decision {
                 id,
                 timestamp_ms,
@@ -216,7 +235,7 @@ impl BurstStrategy {
 
         let mayhem_allowed = classification.has_verified_mayhem_evidence
             || (settings.allow_indirect_mayhem_candidates && classification.is_mayhem_candidate);
-        if settings.require_mayhem_evidence && !mayhem_allowed {
+        if settings.market == Market::MayhemOnly && !mayhem_allowed {
             return Decision {
                 id,
                 timestamp_ms,

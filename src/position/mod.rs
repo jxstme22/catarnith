@@ -37,6 +37,8 @@ pub struct Position {
     pub entry_confirmation_pending: bool,
     #[serde(default)]
     pub entry_signature: Option<String>,
+    #[serde(default)]
+    pub copy_trade_entry: bool,
     pub first_entry_ts_ms: Option<i64>,
     pub last_update_ts_ms: Option<i64>,
 }
@@ -58,6 +60,7 @@ impl Position {
             entry_quote_slot: None,
             entry_confirmation_pending: false,
             entry_signature: None,
+            copy_trade_entry: false,
             first_entry_ts_ms: None,
             last_update_ts_ms: None,
         }
@@ -196,6 +199,9 @@ impl PositionManager {
             };
             position.entry_confirmation_pending = report.status == ExecutionStatus::LiveSubmitted;
             position.entry_signature.clone_from(&report.signature);
+            if order.source_decision_id.starts_with("decision-copy-") {
+                position.copy_trade_entry = true;
+            }
         } else if !matches!(
             report.status,
             ExecutionStatus::PaperRejected | ExecutionStatus::LiveSubmitted

@@ -233,7 +233,11 @@ fn render_centered(frame: &mut Frame, area: Rect, lines: Vec<Line>, _fg: Color, 
 fn render_header(frame: &mut Frame, area: Rect, state: &ScanState, palette: &Palette) {
     let spinner = spinner_frame(state.tick);
     let phase_label = state.phase.label();
-    let blink = if state.tick % 2 == 0 { "●" } else { "○" };
+    let blink = if state.tick.is_multiple_of(2) {
+        "●"
+    } else {
+        "○"
+    };
 
     // Vertically center the content within the 3-row header.
     let v = Layout::default()
@@ -294,7 +298,7 @@ fn render_header(frame: &mut Frame, area: Rect, state: &ScanState, palette: &Pal
 fn render_footer(frame: &mut Frame, area: Rect, state: &ScanState, palette: &Palette) {
     let controls = match state.phase {
         Phase::ModePicker => "[1] Auto Bot  [2] Live  [3] Paper  [S] Settings",
-        Phase::Welcome => "[any] start  [T] theme  [Q] quit  [L] logs",
+        Phase::Welcome => "[Enter] start  [T] theme  [Q] quit  [L] logs",
         Phase::Holding if state.confirm_exit => {
             "[ESC] confirm leave (position stays open)  [any] stay"
         }
@@ -460,7 +464,7 @@ fn render_mode_picker(frame: &mut Frame, area: Rect, state: &ScanState, palette:
 }
 
 fn render_welcome(frame: &mut Frame, area: Rect, state: &ScanState, palette: &Palette) {
-    // Minimal splash: wallpaper, CATARNITH, press any key.
+    // Minimal splash: wallpaper, CATARNITH, press Enter.
     let inner = centered_box(frame, area, 50, 10, "", palette.panel, palette.bg_art_dim);
 
     let lines: Vec<Line> = vec![
@@ -474,9 +478,9 @@ fn render_welcome(frame: &mut Frame, area: Rect, state: &ScanState, palette: &Pa
         Line::from(Span::raw("")),
         Line::from(Span::styled(
             if state.last_trade.is_some() {
-                "press any key to trade again"
+                "press Enter to trade again"
             } else {
-                "press any key to start"
+                "press Enter to start"
             },
             Style::default()
                 .fg(palette.warn)
@@ -492,7 +496,7 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
         frame,
         area,
         64,
-        30,
+        31,
         " SETTINGS ",
         palette.panel,
         palette.bg_art_dim,
@@ -571,6 +575,16 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
             ),
             Span::styled(st.buy_size_sol.clone(), Style::default().fg(palette.fg)),
             Span::styled(" SOL", Style::default().fg(palette.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                marker(SettingsField::Market, "MARKET       "),
+                label_style(SettingsField::Market),
+            ),
+            Span::styled(
+                selector(SettingsField::Market, st.market.label()),
+                Style::default().fg(palette.fg),
+            ),
         ]),
         Line::from(vec![
             Span::styled(
@@ -727,14 +741,11 @@ fn render_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette: &P
         ]));
         lines.push(Line::from(vec![
             Span::styled(
-                marker(SettingsField::JitoTipLamports, "  JITO TIP   "),
-                label_style(SettingsField::JitoTipLamports),
+                marker(SettingsField::JitoTipSol, "  JITO TIP   "),
+                label_style(SettingsField::JitoTipSol),
             ),
-            Span::styled(
-                st.jito_tip_lamports.clone(),
-                Style::default().fg(palette.fg),
-            ),
-            Span::styled(" lamports", Style::default().fg(palette.muted)),
+            Span::styled(st.jito_tip_sol.clone(), Style::default().fg(palette.fg)),
+            Span::styled(" SOL", Style::default().fg(palette.muted)),
         ]));
         lines.push(Line::from(vec![
             Span::styled(
@@ -791,8 +802,8 @@ fn render_bot_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette
     let inner = centered_box(
         frame,
         area,
-        74,
-        26,
+        82,
+        44,
         " AUTO BOT SETUP ",
         palette.panel,
         palette.bg_art_dim,
@@ -854,11 +865,11 @@ fn render_bot_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette
         ]),
         Line::from(vec![
             Span::styled(
-                marker(BotSettingsField::PairScope, "PAIR SCOPE  "),
-                label_style(BotSettingsField::PairScope),
+                marker(BotSettingsField::Market, "MARKET      "),
+                label_style(BotSettingsField::Market),
             ),
             Span::styled(
-                selector(BotSettingsField::PairScope, st.pair_scope.label()),
+                selector(BotSettingsField::Market, st.market.label()),
                 Style::default().fg(palette.fg),
             ),
         ]),
@@ -909,6 +920,82 @@ fn render_bot_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette
             ),
             Span::styled(" ms", Style::default().fg(palette.muted)),
         ]),
+        Line::from(Span::raw("")),
+        Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeEnabled, "COPY TRADE "),
+                label_style(BotSettingsField::CopyTradeEnabled),
+            ),
+            Span::styled(
+                selector(
+                    BotSettingsField::CopyTradeEnabled,
+                    bool_label(st.copy_trade_enabled),
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeWallet, "COPY WALLET"),
+                label_style(BotSettingsField::CopyTradeWallet),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                truncate_line(
+                    &st.copy_trade_wallet,
+                    inner.width.saturating_sub(20) as usize,
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeSizing, "COPY SIZE  "),
+                label_style(BotSettingsField::CopyTradeSizing),
+            ),
+            Span::styled(
+                selector(
+                    BotSettingsField::CopyTradeSizing,
+                    st.copy_trade_sizing.label(),
+                ),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::CopyTradeScaleBps, "SCALE"),
+                label_style(BotSettingsField::CopyTradeScaleBps),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                st.copy_trade_scale_bps.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" bps", Style::default().fg(palette.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeMaxBuySol, "COPY MAX   "),
+                label_style(BotSettingsField::CopyTradeMaxBuySol),
+            ),
+            Span::styled(
+                st.copy_trade_max_buy_sol.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" SOL", Style::default().fg(palette.muted)),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::CopyTradeFollowSells, "SELLS"),
+                label_style(BotSettingsField::CopyTradeFollowSells),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                selector(
+                    BotSettingsField::CopyTradeFollowSells,
+                    bool_label(st.copy_trade_follow_sells),
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ]),
     ];
 
     let toggle_label = if st.show_advanced {
@@ -936,6 +1023,141 @@ fn render_bot_settings(frame: &mut Frame, area: Rect, state: &ScanState, palette
     ]));
 
     if st.show_advanced {
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::BotKeepAlive, "  KEEPALIVE "),
+                label_style(BotSettingsField::BotKeepAlive),
+            ),
+            Span::styled(
+                selector(
+                    BotSettingsField::BotKeepAlive,
+                    bool_label(st.bot_keep_alive),
+                ),
+                Style::default().fg(palette.fg),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::MaxOpenPositions, "  MAX POS   "),
+                label_style(BotSettingsField::MaxOpenPositions),
+            ),
+            Span::styled(
+                st.max_open_positions.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::MaxBuysPerMint, "BUYS/MINT"),
+                label_style(BotSettingsField::MaxBuysPerMint),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                st.max_buys_per_mint.clone(),
+                Style::default().fg(palette.fg),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::MaxPerMintSol, "  PER MINT  "),
+                label_style(BotSettingsField::MaxPerMintSol),
+            ),
+            Span::styled(st.max_per_mint_sol.clone(), Style::default().fg(palette.fg)),
+            Span::styled(" SOL", Style::default().fg(palette.muted)),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::MaxOpenSol, "OPEN CAP"),
+                label_style(BotSettingsField::MaxOpenSol),
+            ),
+            Span::raw(" "),
+            Span::styled(st.max_open_sol.clone(), Style::default().fg(palette.fg)),
+            Span::styled(" SOL", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::DailyLossSol, "  DAILY LOSS"),
+                label_style(BotSettingsField::DailyLossSol),
+            ),
+            Span::styled(st.daily_loss_sol.clone(), Style::default().fg(palette.fg)),
+            Span::styled(" SOL", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeBuyPolicy, "  COPY MODE "),
+                label_style(BotSettingsField::CopyTradeBuyPolicy),
+            ),
+            Span::styled(
+                selector(
+                    BotSettingsField::CopyTradeBuyPolicy,
+                    st.copy_trade_buy_policy.label(),
+                ),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::CopyTradeMaxBuysPerMint, "MAX BUYS"),
+                label_style(BotSettingsField::CopyTradeMaxBuysPerMint),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                st.copy_trade_max_buys_per_mint.clone(),
+                Style::default().fg(palette.fg),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeMinSourceBuySol, "  MIN SRC   "),
+                label_style(BotSettingsField::CopyTradeMinSourceBuySol),
+            ),
+            Span::styled(
+                st.copy_trade_min_source_buy_sol.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" SOL", Style::default().fg(palette.muted)),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::CopyTradeMaxHoldSecs, "COPY HOLD"),
+                label_style(BotSettingsField::CopyTradeMaxHoldSecs),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                st.copy_trade_max_hold_secs.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" s", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeTakeProfitBps, "  COPY TP   "),
+                label_style(BotSettingsField::CopyTradeTakeProfitBps),
+            ),
+            Span::styled(
+                st.copy_trade_take_profit_bps.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" bps", Style::default().fg(palette.muted)),
+            Span::styled("  ", Style::default().fg(palette.muted)),
+            Span::styled(
+                marker(BotSettingsField::CopyTradeTakeProfitSellBps, "SELL"),
+                label_style(BotSettingsField::CopyTradeTakeProfitSellBps),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                st.copy_trade_take_profit_sell_bps.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" bps", Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker(BotSettingsField::CopyTradeStopLossBps, "  COPY SL   "),
+                label_style(BotSettingsField::CopyTradeStopLossBps),
+            ),
+            Span::styled(
+                st.copy_trade_stop_loss_bps.clone(),
+                Style::default().fg(palette.fg),
+            ),
+            Span::styled(" bps", Style::default().fg(palette.muted)),
+        ]));
         lines.push(Line::from(vec![
             Span::styled(
                 marker(BotSettingsField::CreateSlotLag, "  SLOT LAG   "),
@@ -1056,36 +1278,37 @@ fn render_bot_screen(frame: &mut Frame, area: Rect, state: &ScanState, palette: 
         palette.bg_art_dim,
     );
 
-    let capacity = inner.height.max(1) as usize;
+    let header = if state.log_scroll == 0 {
+        format!("tail · {} lines", state.logs.len())
+    } else {
+        format!("scroll +{} · {} lines", state.log_scroll, state.logs.len())
+    };
+    let capacity = inner.height.saturating_sub(1).max(1) as usize;
     let max_width = inner.width.saturating_sub(2).max(1) as usize;
 
-    // Show the newest logs at the bottom so the panel auto-scrolls.
-    let logs: Vec<String> = state
-        .logs
-        .iter()
-        .rev()
-        .take(capacity)
-        .rev()
-        .map(|line| truncate_line(line, max_width))
-        .collect();
-
-    let lines: Vec<Line> = logs
-        .iter()
-        .map(|line| {
-            let lower = line.to_lowercase();
-            let color =
-                if lower.contains("sell") || lower.contains("panic") || lower.contains("error") {
-                    palette.danger
-                } else if lower.contains("buy") {
-                    palette.success
-                } else if lower.starts_with("heartbeat") {
-                    palette.muted
-                } else {
-                    palette.fg
-                };
-            Line::from(Span::styled(format!(" {line}"), Style::default().fg(color)))
-        })
-        .collect();
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        format!(" {header}  ↑/↓ scroll  End tail"),
+        Style::default().fg(palette.muted),
+    ))];
+    lines.extend(
+        visible_log_lines(state, capacity, max_width)
+            .map(|line| {
+                let lower = line.to_lowercase();
+                let color =
+                    if lower.contains("sell") || lower.contains("panic") || lower.contains("error")
+                    {
+                        palette.danger
+                    } else if lower.contains("buy") {
+                        palette.success
+                    } else if lower.starts_with("heartbeat") {
+                        palette.muted
+                    } else {
+                        palette.fg
+                    };
+                Line::from(Span::styled(format!(" {line}"), Style::default().fg(color)))
+            })
+            .collect::<Vec<_>>(),
+    );
 
     let log_h = lines.len() as u16;
     let filler_h = inner.height.saturating_sub(log_h);
@@ -1384,12 +1607,8 @@ fn render_log_panel(
     );
 
     let capacity = inner.height.saturating_sub(2).max(1) as usize;
-    let lines: Vec<Line> = state
-        .logs
-        .iter()
-        .rev()
-        .take(capacity)
-        .rev()
+    let max_width = inner.width.saturating_sub(2).max(1) as usize;
+    let lines: Vec<Line> = visible_log_lines(state, capacity, max_width)
         .map(|line| {
             Line::from(Span::styled(
                 format!(" {line}"),
@@ -1407,24 +1626,52 @@ fn render_log_overlay(frame: &mut Frame, area: Rect, state: &ScanState, palette:
         area,
         76,
         18,
-        " LOGS ",
+        if state.log_scroll == 0 {
+            " LOGS · TAIL "
+        } else {
+            " LOGS · SCROLLED "
+        },
         palette.panel,
         palette.bg_art_dim,
     );
-    let lines: Vec<Line> = state
-        .logs
-        .iter()
-        .map(|line| {
-            Line::from(Span::styled(
-                format!("  {line}"),
-                Style::default().fg(palette.fg),
-            ))
-        })
-        .collect();
+    let capacity = popup.height.saturating_sub(1).max(1) as usize;
+    let max_width = popup.width.saturating_sub(4).max(1) as usize;
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        "  ↑/↓ or PgUp/PgDn scroll · End returns to tail",
+        Style::default().fg(palette.muted),
+    ))];
+    lines.extend(
+        visible_log_lines(state, capacity, max_width)
+            .map(|line| {
+                Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(palette.fg),
+                ))
+            })
+            .collect::<Vec<_>>(),
+    );
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .style(Style::default().bg(PANEL_BG));
     frame.render_widget(p, popup);
+}
+
+fn visible_log_lines(
+    state: &ScanState,
+    capacity: usize,
+    max_width: usize,
+) -> impl Iterator<Item = String> + '_ {
+    let len = state.logs.len();
+    let capacity = capacity.max(1).min(len.max(1));
+    let scroll = state.log_scroll.min(len.saturating_sub(1));
+    let end = len.saturating_sub(scroll);
+    let start = end.saturating_sub(capacity);
+    state
+        .logs
+        .iter()
+        .skip(start)
+        .take(end.saturating_sub(start))
+        .map(move |line| truncate_line(line, max_width))
 }
 
 fn clear_block(
@@ -1935,7 +2182,7 @@ mod tests {
         );
         assert!(
             !text.contains("PAIR SCOPE"),
-            "pair scope belongs to Auto Bot setup"
+            "legacy pair scope label should not render"
         );
         assert!(
             !text.contains("MODE         "),
@@ -1955,7 +2202,13 @@ mod tests {
         state.bot_settings.max_hold_secs = "4".into();
         state.bot_settings.max_stream_event_age_ms = "500".into();
         state.bot_settings.entry_deadline_ms = "550".into();
-        state.bot_settings.active_field = BotSettingsField::PairScope;
+        state.bot_settings.max_open_positions = "3".into();
+        state.bot_settings.max_buys_per_mint = "5".into();
+        state.bot_settings.max_per_mint_sol = "0.1000".into();
+        state.bot_settings.max_open_sol = "0.3000".into();
+        state.bot_settings.daily_loss_sol = "0.5000".into();
+        state.bot_settings.show_advanced = true;
+        state.bot_settings.active_field = BotSettingsField::Market;
         terminal
             .draw(|frame| render(frame, &state))
             .expect("bot settings render should not panic");
@@ -1967,8 +2220,11 @@ mod tests {
             }
         }
         assert!(text.contains("AUTO BOT SETUP"));
-        assert!(text.contains("PAIR SCOPE"));
+        assert!(text.contains("MARKET"));
         assert!(text.contains("BUY DEADLINE"));
+        assert!(text.contains("MAX POS"));
+        assert!(text.contains("PER MINT"));
+        assert!(text.contains("DAILY LOSS"));
         assert!(text.contains("save+start"));
     }
 

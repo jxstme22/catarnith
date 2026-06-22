@@ -30,8 +30,6 @@ use ratatui::{
 };
 
 /// Render the full terminal frame. The caller owns the `Frame`.
-
-/// Render the full terminal frame. The caller owns the `Frame`.
 pub fn render(frame: &mut Frame, state: &TerminalState) {
     let palette = neon_palette(state.theme);
 

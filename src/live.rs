@@ -7,7 +7,7 @@ use solana_pubkey::Pubkey;
 mod imp {
     use super::*;
     use crate::{
-        config::TOKEN_2022_PROGRAM,
+        config::Market,
         types::{BuyOrder, ExecutionStatus, Mode, SellOrder},
     };
     use anyhow::{bail, Context};
@@ -287,9 +287,9 @@ mod imp {
                     .map(|s| Pubkey::from_str(&s))
                     .transpose()
                     .context("jito tip account is not a valid pubkey")?,
-                jito_tip_lamports: env_u64(
-                    "MAYHEM_LIVE_JITO_TIP_LAMPORTS",
-                    cfg.live.jito_tip_lamports,
+                jito_tip_lamports: env_sol_lamports(
+                    "MAYHEM_LIVE_JITO_TIP_SOL",
+                    env_u64("MAYHEM_LIVE_JITO_TIP_LAMPORTS", cfg.live.jito_tip_lamports)?,
                 )?,
                 panic_send_timeout: Duration::from_millis(env_u64(
                     "MAYHEM_LIVE_PANIC_SEND_TIMEOUT_MS",
@@ -407,13 +407,17 @@ mod imp {
                     .get_balance(&self.user)
                     .await
                     .context("fetch live SOL balance before send")?;
-                let max_balance = env_u64(
-                    "MAYHEM_LIVE_MAX_BALANCE_LAMPORTS",
-                    self.cfg.live.max_balance_lamports,
+                let max_balance = env_sol_lamports(
+                    "MAYHEM_LIVE_MAX_BALANCE_SOL",
+                    env_u64(
+                        "MAYHEM_LIVE_MAX_BALANCE_LAMPORTS",
+                        self.cfg.live.max_balance_lamports,
+                    )?,
                 )?;
                 if balance > max_balance {
                     bail!(
-                        "live wallet balance exceeds CTARNITH_LIVE_MAX_BALANCE_LAMPORTS={max_balance}"
+                        "live wallet balance exceeds CTARNITH_LIVE_MAX_BALANCE_SOL={:.4}",
+                        max_balance as f64 / 1_000_000_000.0
                     );
                 }
                 balance
@@ -723,7 +727,7 @@ mod imp {
                     Some(built.input_amount),
                     built.expected_buy_token_amount_raw.map(u128::from),
                     started,
-                    Some(0),
+                    built.expected_sell_lamports,
                 ));
             }
 
@@ -1019,7 +1023,7 @@ mod imp {
                          submitted to one or more RPCs"
                             .to_string(),
                     ),
-                    Some(0),
+                    built.expected_sell_lamports,
                     Some(sell_token_amount_raw),
                     started,
                     Some(self.jito_tip_lamports),
@@ -1069,9 +1073,19 @@ mod imp {
                         Some(self.jito_tip_lamports),
                     ))
                 }
-                Err(err) => Err(err.context(format!(
-                    "panic-sell submitted {signature} but confirmation failed"
-                ))),
+                Err(err) => Ok(self.report(
+                    &order,
+                    Some(signature.to_string()),
+                    None,
+                    ExecutionStatus::LiveSubmitted,
+                    Some(format!(
+                        "panic_sell_confirmation_pending: submitted {signature} but confirmation failed: {err:#}"
+                    )),
+                    Some(0),
+                    Some(sell_token_amount_raw),
+                    started,
+                    Some(self.jito_tip_lamports),
+                )),
             }
         }
 
@@ -1086,25 +1100,21 @@ mod imp {
         /// error. The caller decides whether 0 is acceptable.
         pub async fn fetch_token_balance(&self, mint: &str) -> Result<u128> {
             let mint_pubkey = Pubkey::from_str(mint).context("invalid mint pubkey")?;
+            let mint_account = self
+                .state_rpc
+                .get_account(&mint_pubkey)
+                .await
+                .context("fetch mint account for token balance")?;
+            let base_token_program = live_base_token_program(mint_account.owner)?;
             let (ata, _) = pump_rust_client::pda::associated_token(
                 &self.user,
-                &pump_rust_client::constants::SPL_TOKEN_2022_PROGRAM_ID,
+                &base_token_program,
                 &mint_pubkey,
             );
-            match self.rpc.get_token_account_balance(&ata).await {
-                Ok(balance) => balance
-                    .amount
-                    .parse::<u128>()
-                    .context("parse token balance as u128"),
-                Err(error) => {
-                    let s = error.to_string();
-                    if is_fresh_account_visibility_error(&s) {
-                        Ok(0)
-                    } else {
-                        Err(error).context("fetch live token balance")
-                    }
-                }
-            }
+            self.token_balance_across_rpcs(&ata)
+                .await
+                .map(u128::from)
+                .context("fetch live token balance")
         }
 
         /// Re-fetch pump state and rebuild the sell with a Jito tip
@@ -1118,13 +1128,16 @@ mod imp {
         ) -> Result<solana_sdk::transaction::Transaction> {
             let client = AsyncPumpClient::new(self.state_rpc.clone());
             let sdk = PumpSdk::new();
-            let (pump_config_result, bonding_curve_result, blockhash_result) = tokio::join!(
+            let (pump_config_result, bonding_curve_result, mint_account_result, blockhash_result) = tokio::join!(
                 self.fetch_pump_config(&client),
                 client.fetch_bonding_curve(&mint),
+                self.state_rpc.get_account(&mint),
                 self.state_rpc.get_latest_blockhash(),
             );
             let (global, fee_config) = pump_config_result?;
             let bonding_curve = bonding_curve_result?;
+            let mint_account = mint_account_result.context("fetch mint account for jito sell")?;
+            let base_token_program = live_base_token_program(mint_account.owner)?;
             let blockhash = blockhash_result?;
 
             let quote = sell_sol_amount_from_token_amount(
@@ -1141,7 +1154,7 @@ mod imp {
                     &global,
                     &bonding_curve,
                     mint,
-                    constants::SPL_TOKEN_PROGRAM_ID,
+                    base_token_program,
                     self.user,
                     amount,
                     protected,
@@ -1176,10 +1189,15 @@ mod imp {
         ) -> Result<BuiltTrade> {
             let client = AsyncPumpClient::new(self.state_rpc.clone());
             let sdk = PumpSdk::new();
-            let token_account =
-                pda::associated_token(&self.user, &constants::SPL_TOKEN_2022_PROGRAM_ID, &mint).0;
-
             if let Order::Sell(SellOrder { .. }) = order {
+                let mint_account = self
+                    .fetch_fresh_rpc_state(order, "mint_account", || {
+                        self.state_rpc.get_account(&mint)
+                    })
+                    .await
+                    .context("fetch mint account")?;
+                let base_token_program = live_base_token_program(mint_account.owner)?;
+                let token_account = pda::associated_token(&self.user, &base_token_program, &mint).0;
                 let (
                     wallet_amount_result,
                     pump_config_result,
@@ -1218,7 +1236,9 @@ mod imp {
                     bail!("bonding curve is complete; PumpSwap live execution is not implemented");
                 }
                 if bonding_curve.quote_mint != Pubkey::default() {
-                    bail!("only native-SOL Mayhem curves are supported by live execution");
+                    bail!(
+                        "only native-SOL Pump.fun bonding curves are supported by live execution"
+                    );
                 }
 
                 let quote = sell_sol_amount_from_token_amount(
@@ -1237,7 +1257,7 @@ mod imp {
                         &global,
                         &bonding_curve,
                         mint,
-                        constants::SPL_TOKEN_PROGRAM_ID,
+                        base_token_program,
                         self.user,
                         amount,
                         protected,
@@ -1275,9 +1295,9 @@ mod imp {
             ) = tokio::join!(
                 self.fetch_pump_config(&client),
                 self.fetch_bonding_curve_for_order(&client, order, &mint),
-                self.fetch_fresh_rpc_state(order, "mint_account", || {
-                    self.state_rpc.get_account(&mint)
-                }),
+                self.fetch_fresh_rpc_state(order, "mint_account", || self
+                    .state_rpc
+                    .get_account(&mint)),
                 self.fetch_fresh_rpc_state(order, "mint_supply", || {
                     self.state_rpc.get_token_supply(&mint)
                 }),
@@ -1291,18 +1311,17 @@ mod imp {
                 bail!("bonding curve is complete; PumpSwap live execution is not implemented");
             }
             if matches!(order, Order::Buy(_))
-                && self.cfg.require_curve_mayhem_flag
+                && require_mayhem_curve_flag(&self.cfg)
                 && !bonding_curve.is_mayhem_mode
             {
                 bail!("refusing live execution because the on-chain curve is not Mayhem mode");
             }
             if bonding_curve.quote_mint != Pubkey::default() {
-                bail!("only native-SOL Mayhem curves are supported by live execution");
+                bail!("only native-SOL Pump.fun bonding curves are supported by live execution");
             }
             let mint_account = mint_account_result.context("fetch mint account")?;
-            if mint_account.owner.to_string() != TOKEN_2022_PROGRAM {
-                bail!("live execution currently supports Token-2022 Mayhem mints only");
-            }
+            let base_token_program = live_base_token_program(mint_account.owner)?;
+            let token_account = pda::associated_token(&self.user, &base_token_program, &mint).0;
 
             let supply = supply_result
                 .context("fetch mint supply")?
@@ -1345,7 +1364,7 @@ mod imp {
                             &global,
                             &bonding_curve,
                             mint,
-                            constants::SPL_TOKEN_PROGRAM_ID,
+                            base_token_program,
                             self.user,
                             *lamports,
                             protected,
@@ -1686,6 +1705,7 @@ mod imp {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn wait_for_confirmation(
         primary: &RpcClient,
         fallback: &RpcClient,
@@ -1769,7 +1789,7 @@ mod imp {
                     primary_empty_polls = 0;
                 } else {
                     primary_empty_polls = primary_empty_polls.saturating_add(1);
-                    let probe_fallback = primary_empty_polls % 3 == 0
+                    let probe_fallback = primary_empty_polls.is_multiple_of(3)
                         || last_error.is_some()
                         || remaining
                             <= poll
@@ -2096,7 +2116,7 @@ mod imp {
         // `require_manual_live_unlock=false` must both be set in the
         // active config (or via their MAYHEM_LIVE_* env overrides). The
         // genuinely protective gates (wallet outside the repo, chmod 600
-        // secrets, distinct paid fallback RPC, and the max-balance cap)
+        // secrets, optional distinct paid fallback RPC, and the max-balance cap)
         // are enforced elsewhere and are not relaxed here.
         if !cfg.enable_live_trading {
             bail!("live trading is locked: set enable_live_trading=true after paper validation");
@@ -2169,6 +2189,21 @@ mod imp {
         u64::try_from(protected.max(1)).context("protected output exceeds u64")
     }
 
+    fn require_mayhem_curve_flag(cfg: &Config) -> bool {
+        cfg.require_curve_mayhem_flag && cfg.market == Market::MayhemOnly
+    }
+
+    fn live_base_token_program(owner: Pubkey) -> Result<Pubkey> {
+        if owner == constants::SPL_TOKEN_PROGRAM_ID || owner == constants::SPL_TOKEN_2022_PROGRAM_ID
+        {
+            Ok(owner)
+        } else {
+            bail!(
+                "live execution supports SPL Token or Token-2022 Pump.fun mints only; mint owner={owner}"
+            );
+        }
+    }
+
     fn env_u32(name: &str, default: u32) -> Result<u32> {
         match crate::config::env_lookup(name) {
             Some(value) => value
@@ -2194,6 +2229,21 @@ mod imp {
             Some(value) => value
                 .parse::<u64>()
                 .with_context(|| format!("{name} must be an unsigned integer")),
+            None => Ok(default),
+        }
+    }
+
+    fn env_sol_lamports(name: &str, default: u64) -> Result<u64> {
+        match crate::config::env_lookup(name) {
+            Some(value) => {
+                let sol = value
+                    .parse::<f64>()
+                    .with_context(|| format!("{name} must be a SOL number"))?;
+                if !sol.is_finite() || sol < 0.0 {
+                    bail!("{name} must be a non-negative SOL number");
+                }
+                Ok((sol * 1_000_000_000.0).round() as u64)
+            }
             None => Ok(default),
         }
     }
@@ -2301,6 +2351,35 @@ mod imp {
             assert!(second.is_err());
             drop(first);
             acquire_wallet_lock(&wallet).expect("lock should release when executor drops");
+        }
+
+        #[test]
+        fn mayhem_curve_flag_is_required_only_for_mayhem_market() {
+            let mut cfg = Config {
+                require_curve_mayhem_flag: true,
+                market: Market::MayhemOnly,
+                ..Config::default()
+            };
+            assert!(require_mayhem_curve_flag(&cfg));
+
+            cfg.market = Market::NonMayhemOnly;
+            assert!(!require_mayhem_curve_flag(&cfg));
+
+            cfg.market = Market::AllPumpfun;
+            assert!(!require_mayhem_curve_flag(&cfg));
+        }
+
+        #[test]
+        fn live_base_token_program_accepts_spl_and_token_2022() {
+            assert_eq!(
+                live_base_token_program(constants::SPL_TOKEN_PROGRAM_ID).unwrap(),
+                constants::SPL_TOKEN_PROGRAM_ID
+            );
+            assert_eq!(
+                live_base_token_program(constants::SPL_TOKEN_2022_PROGRAM_ID).unwrap(),
+                constants::SPL_TOKEN_2022_PROGRAM_ID
+            );
+            assert!(live_base_token_program(Pubkey::new_unique()).is_err());
         }
 
         #[test]

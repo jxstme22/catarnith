@@ -2,7 +2,7 @@ mod common;
 
 use catarnith::{
     classifier::{classify_token, ClassifierConfig},
-    config::Config,
+    config::{Config, Market},
     mayhem::{
         apply_mayhem_evidence, parse_mayhem_metadata_json, MayhemEvidenceClient,
         MayhemEvidenceConfig,
@@ -268,6 +268,79 @@ fn live_freshness_strategy_requires_create_backed_discovery() {
         },
     );
     assert_eq!(create_source.action, Action::Buy);
+}
+
+#[test]
+fn non_mayhem_market_requires_fresh_create_entry() {
+    let cfg = Config {
+        market: Market::NonMayhemOnly,
+        require_route_confirmation: false,
+        ..Config::default()
+    };
+    let decoded = decoded_buy(vec![cfg.pumpfun_program.clone()]);
+    let classification = classify_token(&decoded, &ClassifierConfig::default());
+    let settings = StrategySettings::from(&cfg);
+    let context = StrategyContext {
+        open_positions: 0,
+        has_position_for_mint: false,
+        buys_for_mint: 0,
+        has_discovery_signal: false,
+        has_fresh_mint_discovery: false,
+        discovery_seen_ts_ms: None,
+        observed_buy_lamports: Some(100_000_000),
+        observed_buys_for_mint: 1,
+        observed_sells_for_mint: 0,
+    };
+
+    let mut strategy = BurstStrategy::default();
+    let stale_buy = strategy.decide(&settings, &decoded, &classification, context);
+    assert_eq!(stale_buy.action, Action::Ignore);
+    assert_eq!(
+        stale_buy.reason_codes,
+        vec!["fresh_entry_tx_creation_required"]
+    );
+
+    let mut create_decoded = decoded.clone();
+    create_decoded
+        .instruction_names
+        .insert(0, "CreateV2".to_string());
+    let create_classification = classify_token(&create_decoded, &ClassifierConfig::default());
+    let mut strategy = BurstStrategy::default();
+    let fresh_buy = strategy.decide(&settings, &create_decoded, &create_classification, context);
+    assert_eq!(fresh_buy.action, Action::Buy);
+
+    let mut direct_mayhem_create = create_decoded.clone();
+    direct_mayhem_create
+        .program_ids
+        .push(cfg.mayhem_program.clone());
+    let direct_mayhem_classification =
+        classify_token(&direct_mayhem_create, &ClassifierConfig::default());
+    let mut strategy = BurstStrategy::default();
+    let direct_mayhem = strategy.decide(
+        &settings,
+        &direct_mayhem_create,
+        &direct_mayhem_classification,
+        context,
+    );
+    assert_eq!(direct_mayhem.action, Action::Ignore);
+    assert_eq!(direct_mayhem.reason_codes, vec!["non_mayhem_market_only"]);
+
+    let mut indirect_mayhem_create = create_decoded.clone();
+    indirect_mayhem_create
+        .program_ids
+        .push(cfg.token_2022_program.clone());
+    let indirect_mayhem_classification =
+        classify_token(&indirect_mayhem_create, &ClassifierConfig::default());
+    assert!(indirect_mayhem_classification.is_mayhem_candidate);
+    let mut strategy = BurstStrategy::default();
+    let indirect_mayhem = strategy.decide(
+        &settings,
+        &indirect_mayhem_create,
+        &indirect_mayhem_classification,
+        context,
+    );
+    assert_eq!(indirect_mayhem.action, Action::Ignore);
+    assert_eq!(indirect_mayhem.reason_codes, vec!["non_mayhem_market_only"]);
 }
 
 #[test]

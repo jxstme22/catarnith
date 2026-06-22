@@ -29,7 +29,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use catarnith::{
-    config::{Config, PairScope},
+    config::{Config, CopyTradeBuyPolicy, CopyTradeSizing, Market},
     curve::BondingCurveState,
     curve_stream::spawn_curve_watch,
     decoder::extract_pump_create_event_mint,
@@ -50,6 +50,7 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::commitment_config::CommitmentConfig;
 use std::{
     collections::VecDeque,
+    process::ExitStatus,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -60,6 +61,9 @@ use tokio::sync::{mpsc, RwLock};
 /// a useful tail of autonomous bot output inside the TUI.
 const LOG_CAP: usize = 256;
 const CREATE_SLOT_CACHE_TTL_MS: i64 = 250;
+const BOT_CHILD_TAIL: usize = 8;
+const BOT_RAPID_FAILURE_LIMIT: u32 = 3;
+const BOT_RAPID_FAILURE_WINDOW: Duration = Duration::from_secs(5);
 
 mod ascii_bg;
 mod render;
@@ -72,7 +76,7 @@ pub enum Phase {
     /// Mode picker: 1=auto bot, 2=live, 3=paper, S=settings. This is
     /// the first screen when `catarnith` is run with no subcommand.
     ModePicker,
-    /// Big "press any key" splash. We sit here between trades.
+    /// Big "press Enter" splash. We sit here between trades.
     Welcome,
     /// Subscribed to WS, waiting for a `Create` event.
     Scanning,
@@ -131,6 +135,7 @@ pub enum SettingsField {
     #[default]
     Wallet,
     BuySize,
+    Market,
     HeliusKey,
     FallbackRpc,
     JupiterKey,
@@ -145,7 +150,7 @@ pub enum SettingsField {
     SellSlippageBps,
     PriorityFee,
     JitoUrl,
-    JitoTipLamports,
+    JitoTipSol,
     ConfirmationPollMs,
     PreBroadcastSimulation,
 }
@@ -164,7 +169,7 @@ impl SettingsField {
                 | SellSlippageBps
                 | PriorityFee
                 | JitoUrl
-                | JitoTipLamports
+                | JitoTipSol
                 | ConfirmationPollMs
                 | PreBroadcastSimulation
         )
@@ -178,7 +183,8 @@ fn next_field(f: SettingsField, show_advanced: bool) -> SettingsField {
     use SettingsField::*;
     let next = match f {
         Wallet => BuySize,
-        BuySize => HeliusKey,
+        BuySize => Market,
+        Market => HeliusKey,
         HeliusKey => FallbackRpc,
         FallbackRpc => JupiterKey,
         JupiterKey => SlippageBps,
@@ -191,8 +197,8 @@ fn next_field(f: SettingsField, show_advanced: bool) -> SettingsField {
         MaxHoldSecs => SellSlippageBps,
         SellSlippageBps => PriorityFee,
         PriorityFee => JitoUrl,
-        JitoUrl => JitoTipLamports,
-        JitoTipLamports => ConfirmationPollMs,
+        JitoUrl => JitoTipSol,
+        JitoTipSol => ConfirmationPollMs,
         ConfirmationPollMs => PreBroadcastSimulation,
         PreBroadcastSimulation => Wallet,
     };
@@ -217,7 +223,8 @@ fn prev_field(f: SettingsField, show_advanced: bool) -> SettingsField {
             }
         }
         BuySize => Wallet,
-        HeliusKey => BuySize,
+        Market => BuySize,
+        HeliusKey => Market,
         FallbackRpc => HeliusKey,
         JupiterKey => FallbackRpc,
         SlippageBps => JupiterKey,
@@ -230,8 +237,8 @@ fn prev_field(f: SettingsField, show_advanced: bool) -> SettingsField {
         SellSlippageBps => MaxHoldSecs,
         PriorityFee => SellSlippageBps,
         JitoUrl => PriorityFee,
-        JitoTipLamports => JitoUrl,
-        ConfirmationPollMs => JitoTipLamports,
+        JitoTipSol => JitoUrl,
+        ConfirmationPollMs => JitoTipSol,
         PreBroadcastSimulation => ConfirmationPollMs,
     };
     if prev.is_advanced() && !show_advanced {
@@ -246,13 +253,32 @@ fn prev_field(f: SettingsField, show_advanced: bool) -> SettingsField {
 pub enum BotSettingsField {
     #[default]
     Mode,
-    PairScope,
+    Market,
     BuySize,
     SlippageBps,
     MaxHoldSecs,
     StreamAgeMs,
     EntryDeadlineMs,
+    CopyTradeEnabled,
+    CopyTradeWallet,
+    CopyTradeSizing,
+    CopyTradeScaleBps,
+    CopyTradeMaxBuySol,
+    CopyTradeFollowSells,
     AdvancedToggle,
+    BotKeepAlive,
+    MaxOpenPositions,
+    MaxBuysPerMint,
+    MaxPerMintSol,
+    MaxOpenSol,
+    DailyLossSol,
+    CopyTradeBuyPolicy,
+    CopyTradeMaxBuysPerMint,
+    CopyTradeMinSourceBuySol,
+    CopyTradeMaxHoldSecs,
+    CopyTradeTakeProfitBps,
+    CopyTradeTakeProfitSellBps,
+    CopyTradeStopLossBps,
     CreateSlotLag,
     BackfillLimit,
     FetchFullTransaction,
@@ -266,7 +292,20 @@ impl BotSettingsField {
         use BotSettingsField::*;
         matches!(
             self,
-            CreateSlotLag
+            BotKeepAlive
+                | MaxOpenPositions
+                | MaxBuysPerMint
+                | MaxPerMintSol
+                | MaxOpenSol
+                | DailyLossSol
+                | CopyTradeBuyPolicy
+                | CopyTradeMaxBuysPerMint
+                | CopyTradeMinSourceBuySol
+                | CopyTradeMaxHoldSecs
+                | CopyTradeTakeProfitBps
+                | CopyTradeTakeProfitSellBps
+                | CopyTradeStopLossBps
+                | CreateSlotLag
                 | BackfillLimit
                 | FetchFullTransaction
                 | CurveExitQuotes
@@ -279,14 +318,33 @@ impl BotSettingsField {
 fn next_bot_field(f: BotSettingsField, show_advanced: bool) -> BotSettingsField {
     use BotSettingsField::*;
     let next = match f {
-        Mode => PairScope,
-        PairScope => BuySize,
+        Mode => Market,
+        Market => BuySize,
         BuySize => SlippageBps,
         SlippageBps => MaxHoldSecs,
         MaxHoldSecs => StreamAgeMs,
         StreamAgeMs => EntryDeadlineMs,
-        EntryDeadlineMs => AdvancedToggle,
-        AdvancedToggle => CreateSlotLag,
+        EntryDeadlineMs => CopyTradeEnabled,
+        CopyTradeEnabled => CopyTradeWallet,
+        CopyTradeWallet => CopyTradeSizing,
+        CopyTradeSizing => CopyTradeScaleBps,
+        CopyTradeScaleBps => CopyTradeMaxBuySol,
+        CopyTradeMaxBuySol => CopyTradeFollowSells,
+        CopyTradeFollowSells => AdvancedToggle,
+        AdvancedToggle => BotKeepAlive,
+        BotKeepAlive => MaxOpenPositions,
+        MaxOpenPositions => MaxBuysPerMint,
+        MaxBuysPerMint => MaxPerMintSol,
+        MaxPerMintSol => MaxOpenSol,
+        MaxOpenSol => DailyLossSol,
+        DailyLossSol => CopyTradeBuyPolicy,
+        CopyTradeBuyPolicy => CopyTradeMaxBuysPerMint,
+        CopyTradeMaxBuysPerMint => CopyTradeMinSourceBuySol,
+        CopyTradeMinSourceBuySol => CopyTradeMaxHoldSecs,
+        CopyTradeMaxHoldSecs => CopyTradeTakeProfitBps,
+        CopyTradeTakeProfitBps => CopyTradeTakeProfitSellBps,
+        CopyTradeTakeProfitSellBps => CopyTradeStopLossBps,
+        CopyTradeStopLossBps => CreateSlotLag,
         CreateSlotLag => BackfillLimit,
         BackfillLimit => FetchFullTransaction,
         FetchFullTransaction => CurveExitQuotes,
@@ -311,14 +369,33 @@ fn prev_bot_field(f: BotSettingsField, show_advanced: bool) -> BotSettingsField 
                 AdvancedToggle
             }
         }
-        PairScope => Mode,
-        BuySize => PairScope,
+        Market => Mode,
+        BuySize => Market,
         SlippageBps => BuySize,
         MaxHoldSecs => SlippageBps,
         StreamAgeMs => MaxHoldSecs,
         EntryDeadlineMs => StreamAgeMs,
-        AdvancedToggle => EntryDeadlineMs,
-        CreateSlotLag => AdvancedToggle,
+        CopyTradeEnabled => EntryDeadlineMs,
+        CopyTradeWallet => CopyTradeEnabled,
+        CopyTradeSizing => CopyTradeWallet,
+        CopyTradeScaleBps => CopyTradeSizing,
+        CopyTradeMaxBuySol => CopyTradeScaleBps,
+        CopyTradeFollowSells => CopyTradeMaxBuySol,
+        AdvancedToggle => CopyTradeFollowSells,
+        BotKeepAlive => AdvancedToggle,
+        MaxOpenPositions => BotKeepAlive,
+        MaxBuysPerMint => MaxOpenPositions,
+        MaxPerMintSol => MaxBuysPerMint,
+        MaxOpenSol => MaxPerMintSol,
+        DailyLossSol => MaxOpenSol,
+        CopyTradeBuyPolicy => DailyLossSol,
+        CopyTradeMaxBuysPerMint => CopyTradeBuyPolicy,
+        CopyTradeMinSourceBuySol => CopyTradeMaxBuysPerMint,
+        CopyTradeMaxHoldSecs => CopyTradeMinSourceBuySol,
+        CopyTradeTakeProfitBps => CopyTradeMaxHoldSecs,
+        CopyTradeTakeProfitSellBps => CopyTradeTakeProfitBps,
+        CopyTradeStopLossBps => CopyTradeTakeProfitSellBps,
+        CreateSlotLag => CopyTradeStopLossBps,
         BackfillLimit => CreateSlotLag,
         FetchFullTransaction => BackfillLimit,
         CurveExitQuotes => FetchFullTransaction,
@@ -337,6 +414,7 @@ fn prev_bot_field(f: BotSettingsField, show_advanced: bool) -> BotSettingsField 
 pub struct SettingsState {
     pub wallet_b58: String,
     pub buy_size_sol: String,
+    pub market: Market,
     pub helius_key: String,
     pub fallback_rpc: String,
     pub jupiter_key: String,
@@ -350,7 +428,7 @@ pub struct SettingsState {
     pub sell_slippage_bps: String,
     pub priority_fee_microlamports: String,
     pub jito_block_engine_url: String,
-    pub jito_tip_lamports: String,
+    pub jito_tip_sol: String,
     pub confirmation_poll_ms: String,
     pub pre_broadcast_simulation: bool,
     /// Whether the advanced live-trade section is expanded.
@@ -365,6 +443,7 @@ impl Default for SettingsState {
         Self {
             wallet_b58: String::new(),
             buy_size_sol: String::new(),
+            market: Market::MayhemOnly,
             helius_key: String::new(),
             fallback_rpc: String::new(),
             jupiter_key: String::new(),
@@ -377,7 +456,7 @@ impl Default for SettingsState {
             sell_slippage_bps: String::new(),
             priority_fee_microlamports: String::new(),
             jito_block_engine_url: String::new(),
-            jito_tip_lamports: String::new(),
+            jito_tip_sol: String::new(),
             confirmation_poll_ms: String::new(),
             pre_broadcast_simulation: true,
             show_advanced: false,
@@ -393,12 +472,31 @@ impl Default for SettingsState {
 pub struct BotSettingsState {
     pub config_path: String,
     pub mode: Mode,
-    pub pair_scope: PairScope,
+    pub market: Market,
     pub buy_size_sol: String,
     pub slippage_bps: String,
     pub max_hold_secs: String,
     pub max_stream_event_age_ms: String,
     pub entry_deadline_ms: String,
+    pub copy_trade_enabled: bool,
+    pub copy_trade_wallet: String,
+    pub copy_trade_sizing: CopyTradeSizing,
+    pub copy_trade_scale_bps: String,
+    pub copy_trade_max_buy_sol: String,
+    pub copy_trade_follow_sells: bool,
+    pub bot_keep_alive: bool,
+    pub max_open_positions: String,
+    pub max_buys_per_mint: String,
+    pub max_per_mint_sol: String,
+    pub max_open_sol: String,
+    pub daily_loss_sol: String,
+    pub copy_trade_buy_policy: CopyTradeBuyPolicy,
+    pub copy_trade_max_buys_per_mint: String,
+    pub copy_trade_min_source_buy_sol: String,
+    pub copy_trade_max_hold_secs: String,
+    pub copy_trade_take_profit_bps: String,
+    pub copy_trade_take_profit_sell_bps: String,
+    pub copy_trade_stop_loss_bps: String,
     pub max_create_event_slot_lag: String,
     pub backfill_limit: String,
     pub fetch_full_transaction: bool,
@@ -416,12 +514,31 @@ impl Default for BotSettingsState {
         Self {
             config_path: String::new(),
             mode: Mode::Paper,
-            pair_scope: PairScope::MayhemOnly,
+            market: Market::MayhemOnly,
             buy_size_sol: String::new(),
             slippage_bps: String::new(),
             max_hold_secs: String::new(),
             max_stream_event_age_ms: String::new(),
             entry_deadline_ms: String::new(),
+            copy_trade_enabled: false,
+            copy_trade_wallet: String::new(),
+            copy_trade_sizing: CopyTradeSizing::Fixed,
+            copy_trade_scale_bps: String::new(),
+            copy_trade_max_buy_sol: String::new(),
+            copy_trade_follow_sells: true,
+            bot_keep_alive: true,
+            max_open_positions: String::new(),
+            max_buys_per_mint: String::new(),
+            max_per_mint_sol: String::new(),
+            max_open_sol: String::new(),
+            daily_loss_sol: String::new(),
+            copy_trade_buy_policy: CopyTradeBuyPolicy::FirstOnly,
+            copy_trade_max_buys_per_mint: String::new(),
+            copy_trade_min_source_buy_sol: String::new(),
+            copy_trade_max_hold_secs: String::new(),
+            copy_trade_take_profit_bps: String::new(),
+            copy_trade_take_profit_sell_bps: String::new(),
+            copy_trade_stop_loss_bps: String::new(),
             max_create_event_slot_lag: String::new(),
             backfill_limit: String::new(),
             fetch_full_transaction: true,
@@ -470,6 +587,9 @@ pub struct ScanState {
     pub logs: VecDeque<String>,
     /// Full log overlay toggle (press L).
     pub show_logs: bool,
+    /// Number of lines above the newest log that the log views are scrolled.
+    /// Zero means tail-follow.
+    pub log_scroll: usize,
     /// Wallet label shown in the footer (e.g. "PAPER" or the live
     /// wallet pubkey).
     pub wallet_label: String,
@@ -534,6 +654,7 @@ impl ScanState {
             token_amount_raw: 0,
             logs: VecDeque::with_capacity(LOG_CAP),
             show_logs: false,
+            log_scroll: 0,
             wallet_label: String::new(),
             last_trade: None,
             trades_taken: 0,
@@ -556,10 +677,35 @@ impl ScanState {
     }
 
     pub fn push_log(&mut self, line: impl Into<String>) {
+        let was_scrolled = self.log_scroll > 0;
         if self.logs.len() == LOG_CAP {
             self.logs.pop_front();
         }
         self.logs.push_back(line.into());
+        if was_scrolled {
+            self.log_scroll = self
+                .log_scroll
+                .saturating_add(1)
+                .min(self.logs.len().saturating_sub(1));
+        }
+    }
+
+    pub fn scroll_logs(&mut self, delta: i32) {
+        let max_scroll = self.logs.len().saturating_sub(1);
+        if delta == i32::MIN {
+            self.log_scroll = 0;
+        } else if delta == i32::MAX {
+            self.log_scroll = max_scroll;
+        } else if delta > 0 {
+            self.log_scroll = self
+                .log_scroll
+                .saturating_add(delta as usize)
+                .min(max_scroll);
+        } else if delta < 0 {
+            self.log_scroll = self
+                .log_scroll
+                .saturating_sub(delta.unsigned_abs() as usize);
+        }
     }
 
     pub fn push_mcap(&mut self, ts_ms: i64, mcap_sol: f64) {
@@ -579,6 +725,7 @@ impl SettingsState {
     pub fn reset(&mut self) {
         self.wallet_b58.clear();
         self.buy_size_sol.clear();
+        self.market = Market::MayhemOnly;
         self.helius_key.clear();
         self.fallback_rpc.clear();
         self.jupiter_key.clear();
@@ -588,7 +735,7 @@ impl SettingsState {
         self.sell_slippage_bps.clear();
         self.priority_fee_microlamports.clear();
         self.jito_block_engine_url.clear();
-        self.jito_tip_lamports.clear();
+        self.jito_tip_sol.clear();
         self.confirmation_poll_ms.clear();
         self.show_advanced = false;
         self.active_field = SettingsField::Wallet;
@@ -610,6 +757,20 @@ impl BotSettingsState {
         self.max_hold_secs.clear();
         self.max_stream_event_age_ms.clear();
         self.entry_deadline_ms.clear();
+        self.copy_trade_wallet.clear();
+        self.copy_trade_scale_bps.clear();
+        self.copy_trade_max_buy_sol.clear();
+        self.max_open_positions.clear();
+        self.max_buys_per_mint.clear();
+        self.max_per_mint_sol.clear();
+        self.max_open_sol.clear();
+        self.daily_loss_sol.clear();
+        self.copy_trade_max_buys_per_mint.clear();
+        self.copy_trade_min_source_buy_sol.clear();
+        self.copy_trade_max_hold_secs.clear();
+        self.copy_trade_take_profit_bps.clear();
+        self.copy_trade_take_profit_sell_bps.clear();
+        self.copy_trade_stop_loss_bps.clear();
         self.max_create_event_slot_lag.clear();
         self.backfill_limit.clear();
         self.confirmation_poll_ms.clear();
@@ -717,6 +878,8 @@ pub enum ScanCommand {
     PickSettings,
     /// Operator pressed L; toggle the full log overlay.
     ShowLogs,
+    /// Scroll the log viewport. Positive = older, negative = newer.
+    ScrollLogs(i32),
     /// Printable character typed in a text field (settings).
     Char(char),
     /// Backspace in a text field.
@@ -752,6 +915,7 @@ pub enum ScanEvent {
     TradeClosed(LastTrade),
     /// Toggle the full log overlay (bound to L).
     ToggleLogs,
+    ScrollLogs(i32),
 }
 
 fn main() -> Result<()> {
@@ -871,7 +1035,7 @@ fn print_help() {
     eprintln!("catarnith - CATARNITH Trading CLI");
     eprintln!();
     eprintln!("USAGE:");
-    eprintln!("    catarnith [SUBCOMMAND] [OPTIONS]");
+    eprintln!("    catarnith [OPTIONS] [SUBCOMMAND]");
     eprintln!();
     eprintln!("SUBCOMMANDS:");
     eprintln!(
@@ -886,6 +1050,11 @@ fn print_help() {
     eprintln!("    --config PATH     Path to the config TOML (default: config.toml).");
     eprintln!("    --version, -V     Print the version and exit.");
     eprintln!("    --help, -h        Print this help and exit.");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("    catarnith");
+    eprintln!("    catarnith --config config.toml scan");
+    eprintln!("    catarnith bot --config config.toml");
     eprintln!();
     eprintln!("ENVIRONMENT:");
     eprintln!("    CTARNITH_LIVE_CONFIG       Override the config path.");
@@ -1070,7 +1239,7 @@ fn resolve_config_path_from(
     _cwd: Option<&std::path::Path>,
 ) -> std::path::PathBuf {
     if p.exists() {
-        return p;
+        return std::fs::canonicalize(&p).unwrap_or(p);
     }
     let basename = p
         .file_name()
@@ -1218,6 +1387,9 @@ async fn run(
                 let mut s = state.write().await;
                 s.show_logs = !s.show_logs;
             }
+            Ok(Some(ScanEvent::ScrollLogs(delta))) => {
+                state.write().await.scroll_logs(delta);
+            }
             Ok(None) => break Ok(()),
             Err(_) => {}
         }
@@ -1260,9 +1432,19 @@ fn interpret_key(key: KeyEvent, phase: Phase) -> Option<ScanCommand> {
     let in_settings = matches!(phase, Phase::Settings | Phase::BotSettings);
 
     match key.code {
+        KeyCode::Esc if phase == Phase::Settings || phase == Phase::BotSettings => {
+            Some(ScanCommand::Cancel)
+        }
+        KeyCode::Esc => Some(ScanCommand::Cancel),
         KeyCode::Char('q') | KeyCode::Char('Q') if !in_settings => Some(ScanCommand::Quit),
         KeyCode::Char('t') | KeyCode::Char('T') if !in_settings => Some(ScanCommand::CycleTheme),
         KeyCode::Char('l') | KeyCode::Char('L') if !in_settings => Some(ScanCommand::ShowLogs),
+        KeyCode::PageUp if !in_settings => Some(ScanCommand::ScrollLogs(8)),
+        KeyCode::PageDown if !in_settings => Some(ScanCommand::ScrollLogs(-8)),
+        KeyCode::Home if !in_settings => Some(ScanCommand::ScrollLogs(i32::MAX)),
+        KeyCode::End if !in_settings => Some(ScanCommand::ScrollLogs(i32::MIN)),
+        KeyCode::Up if !in_settings => Some(ScanCommand::ScrollLogs(1)),
+        KeyCode::Down if !in_settings => Some(ScanCommand::ScrollLogs(-1)),
         KeyCode::Char('1') if phase == Phase::ModePicker => Some(ScanCommand::PickBot),
         KeyCode::Char('2') if phase == Phase::ModePicker => Some(ScanCommand::PickLive),
         KeyCode::Char('3') if phase == Phase::ModePicker => Some(ScanCommand::PickPaper),
@@ -1271,7 +1453,6 @@ fn interpret_key(key: KeyEvent, phase: Phase) -> Option<ScanCommand> {
         }
         KeyCode::Char(_) if phase == Phase::ModePicker => None,
         KeyCode::Enter | KeyCode::Char('\n') => Some(ScanCommand::Start),
-        KeyCode::Esc => Some(ScanCommand::Cancel),
         KeyCode::Backspace => Some(ScanCommand::Backspace),
         KeyCode::Tab | KeyCode::Down => Some(ScanCommand::NextField),
         KeyCode::BackTab | KeyCode::Up => Some(ScanCommand::PrevField),
@@ -1283,8 +1464,7 @@ fn interpret_key(key: KeyEvent, phase: Phase) -> Option<ScanCommand> {
 }
 
 /// Wait for a mapped command appropriate for `phase`. Unknown keys
-/// are silently dropped except on the Welcome screen, where any key
-/// starts the cycle.
+/// are silently dropped; Welcome starts only on Enter.
 async fn recv_mapped_command(
     cmd_rx: &mut mpsc::UnboundedReceiver<ScanCommand>,
     phase: Phase,
@@ -1313,10 +1493,25 @@ fn spawn_tick(event_tx: mpsc::UnboundedSender<ScanEvent>) {
     });
 }
 
+async fn close_log_overlay_if_open(
+    state: &Arc<RwLock<ScanState>>,
+    event_tx: &mpsc::UnboundedSender<ScanEvent>,
+) -> bool {
+    let mut s = state.write().await;
+    if !s.show_logs {
+        return false;
+    }
+    s.show_logs = false;
+    drop(s);
+    let _ = event_tx.send(ScanEvent::StateChanged);
+    true
+}
+
 /// The strategy loop. One pass per cycle:
 ///   Mode picker → (BOT / PAPER / LIVE / SETTINGS) →
 ///   Scanning → Evaluating → Holding → Selling → Result → Mode picker
 #[allow(unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 fn spawn_strategy(
     cfg: Config,
     config_path: std::path::PathBuf,
@@ -1350,6 +1545,9 @@ fn spawn_strategy(
                 }
                 Some(ScanCommand::ShowLogs) => {
                     let _ = event_tx.send(ScanEvent::ToggleLogs);
+                }
+                Some(ScanCommand::ScrollLogs(delta)) => {
+                    let _ = event_tx.send(ScanEvent::ScrollLogs(delta));
                 }
                 Some(ScanCommand::Quit) => quit = true,
                 _ => {}
@@ -1606,6 +1804,7 @@ fn append_paper_report(path: &str, report: &ExecutionReport) -> Result<()> {
 /// loop scan → entry → hold → sell → result until the operator
 /// presses Esc (return to mode picker) or Q (quit).
 /// Returns `true` when the operator explicitly quits.
+#[allow(clippy::arc_with_non_send_sync)]
 async fn run_trade_mode(
     base_cfg: &Config,
     config_explicit: bool,
@@ -1728,7 +1927,12 @@ async fn run_trade_mode(
                 while !next && !back {
                     match recv_mapped_command(cmd_rx, Phase::TradeResult).await {
                         Some(ScanCommand::Start) => next = true,
-                        Some(ScanCommand::Cancel) => back = true,
+                        Some(ScanCommand::Cancel) => {
+                            if close_log_overlay_if_open(&state, event_tx).await {
+                                continue;
+                            }
+                            back = true;
+                        }
                         Some(ScanCommand::CycleTheme) => {
                             let mut s = state.write().await;
                             s.theme = s.theme.cycle();
@@ -1739,6 +1943,9 @@ async fn run_trade_mode(
                         }
                         Some(ScanCommand::ShowLogs) => {
                             let _ = event_tx.send(ScanEvent::ToggleLogs);
+                        }
+                        Some(ScanCommand::ScrollLogs(delta)) => {
+                            let _ = event_tx.send(ScanEvent::ScrollLogs(delta));
                         }
                         Some(ScanCommand::Quit) => return Ok(true),
                         _ => {}
@@ -1774,7 +1981,7 @@ fn strip_ansi(line: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch == '\x1b' && chars.peek() == Some(&'[') {
             chars.next(); // skip '['
-            while let Some(inner) = chars.next() {
+            for inner in chars.by_ref() {
                 if inner.is_ascii_alphabetic() {
                     break;
                 }
@@ -1817,17 +2024,17 @@ fn clean_bot_log_line(line: &str) -> Option<String> {
         if let Some(colon_pos) = after_level.find(": ") {
             let msg = &after_level[colon_pos + 2..];
             if msg.starts_with("starting mayhem bot") {
-                return Some("starting mayhem bot".to_string());
+                return Some("bot started".to_string());
             }
             if msg.starts_with("heartbeat ") {
                 return Some(shorten_heartbeat(msg));
             }
-            return Some(msg.to_string());
+            return Some(prettify_bot_log_line(msg));
         }
     }
 
     // Non-tracing lines (e.g. panics) are kept as-is.
-    Some(trimmed.to_string())
+    Some(prettify_bot_log_line(trimmed))
 }
 
 fn lvl_len(trimmed: &str, pos: usize) -> usize {
@@ -1877,6 +2084,65 @@ fn shorten_heartbeat(msg: &str) -> String {
     out
 }
 
+fn prettify_bot_log_line(msg: &str) -> String {
+    if msg.starts_with("live buy confirmed") {
+        return format!(
+            "BUY ok mint={} sig={} latency={}",
+            kv_value(msg, "mint").unwrap_or("?"),
+            kv_value(msg, "signature").unwrap_or("?"),
+            kv_value(msg, "execution_latency_ms").unwrap_or("?"),
+        );
+    }
+    if msg.starts_with("live buy pending") || msg.starts_with("live buy submitted") {
+        return format!(
+            "BUY pending mint={} sig={} latency={}",
+            kv_value(msg, "mint").unwrap_or("?"),
+            kv_value(msg, "signature").unwrap_or("?"),
+            kv_value(msg, "execution_latency_ms").unwrap_or("?"),
+        );
+    }
+    if msg.starts_with("live sell confirmed") {
+        return format!(
+            "SELL ok mint={} reason={} closed={} latency={}",
+            kv_value(msg, "mint").unwrap_or("?"),
+            kv_value(msg, "reason").unwrap_or("?"),
+            kv_value(msg, "closed").unwrap_or("?"),
+            kv_value(msg, "execution_latency_ms").unwrap_or("?"),
+        );
+    }
+    if msg.starts_with("execution rejected") {
+        return format!(
+            "REJECT mint={} reason={}",
+            kv_value(msg, "mint").unwrap_or("?"),
+            kv_value(msg, "reason").unwrap_or("?"),
+        );
+    }
+    if msg.starts_with("live execution failed") {
+        return format!(
+            "FAIL mint={} reason={}",
+            kv_value(msg, "mint").unwrap_or("?"),
+            kv_value(msg, "reason").unwrap_or("?"),
+        );
+    }
+    if msg.starts_with("copy trade decision") {
+        return format!(
+            "COPY action={} mint={} lamports={} reasons={}",
+            kv_value(msg, "action").unwrap_or("?"),
+            kv_value(msg, "mint").unwrap_or("?"),
+            kv_value(msg, "lamports").unwrap_or("?"),
+            kv_value(msg, "reasons").unwrap_or("?"),
+        );
+    }
+    msg.to_string()
+}
+
+fn kv_value<'a>(msg: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    msg.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+        .map(|value| value.trim_end_matches(','))
+}
+
 /// Keep bot lines that explain startup status or trading activity.
 fn is_bot_execution_log(line: &str) -> bool {
     if line.is_empty() {
@@ -1885,6 +2151,7 @@ fn is_bot_execution_log(line: &str) -> bool {
     let lower = line.to_lowercase();
     let keywords = [
         "starting mayhem bot",
+        "bot started",
         "startup check passed",
         "subscribing",
         "confirmed transactionsubscribe subscription",
@@ -1892,6 +2159,13 @@ fn is_bot_execution_log(line: &str) -> bool {
         "transactionsubscribe is unavailable",
         "activating logssubscribe fallback",
         "heartbeat",
+        "copy ",
+        "copy trade",
+        "buy ok",
+        "buy pending",
+        "sell ok",
+        "reject",
+        "fail",
         "candidate",
         "buy_build_diag",
         "execution fill",
@@ -1908,6 +2182,63 @@ fn is_bot_execution_log(line: &str) -> bool {
         "pnl",
     ];
     keywords.iter().any(|k| lower.contains(k))
+}
+
+/// Keep fatal child-process output even when it is not a normal tracing log.
+fn is_bot_fatal_log(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("error:")
+        || lower.starts_with("caused by:")
+        || lower.contains("panicked at")
+        || lower.contains("failed to read config")
+        || lower.contains("failed to parse toml")
+        || lower.contains("not a valid solana pubkey")
+        || lower.contains("copy_trade_enabled requires")
+        || lower.contains("requires fetch_full_transaction=true")
+        || lower.contains("must be a boolean value")
+        || lower.contains("must be positive")
+}
+
+fn remember_bot_child_line(tail: &mut VecDeque<String>, line: &str) {
+    if tail.len() == BOT_CHILD_TAIL {
+        tail.pop_front();
+    }
+    tail.push_back(line.to_string());
+}
+
+fn status_failed(status: Option<&ExitStatus>) -> bool {
+    status.map(|status| !status.success()).unwrap_or(true)
+}
+
+fn emit_bot_exit_diagnostics(
+    event_tx: &mpsc::UnboundedSender<ScanEvent>,
+    status: Option<&ExitStatus>,
+    tail: &VecDeque<String>,
+) {
+    let _ = event_tx.send(ScanEvent::Log(format!(
+        "bot failed status={}",
+        format_exit_status(status)
+    )));
+    if tail.is_empty() {
+        let _ = event_tx.send(ScanEvent::Log(
+            "bot produced no stderr/stdout before exit".to_string(),
+        ));
+        return;
+    }
+    let _ = event_tx.send(ScanEvent::Log("last bot output:".to_string()));
+    for line in tail {
+        let _ = event_tx.send(ScanEvent::Log(format!("  {line}")));
+    }
+}
+
+fn format_exit_status(status: Option<&ExitStatus>) -> String {
+    match status {
+        Some(status) => status
+            .code()
+            .map(|code| format!("exit-code={code}"))
+            .unwrap_or_else(|| status.to_string()),
+        None => "unknown".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1957,11 +2288,28 @@ async fn run_bot_settings(
                             Mode::Live => Mode::Paper,
                         };
                     }
-                    BotSettingsField::PairScope => {
-                        s.bot_settings.pair_scope = s.bot_settings.pair_scope.cycle();
+                    BotSettingsField::Market => {
+                        s.bot_settings.market = s.bot_settings.market.cycle();
+                    }
+                    BotSettingsField::CopyTradeEnabled => {
+                        s.bot_settings.copy_trade_enabled = !s.bot_settings.copy_trade_enabled;
+                    }
+                    BotSettingsField::CopyTradeSizing => {
+                        s.bot_settings.copy_trade_sizing = s.bot_settings.copy_trade_sizing.cycle();
+                    }
+                    BotSettingsField::CopyTradeBuyPolicy => {
+                        s.bot_settings.copy_trade_buy_policy =
+                            s.bot_settings.copy_trade_buy_policy.cycle();
+                    }
+                    BotSettingsField::CopyTradeFollowSells => {
+                        s.bot_settings.copy_trade_follow_sells =
+                            !s.bot_settings.copy_trade_follow_sells;
                     }
                     BotSettingsField::AdvancedToggle => {
                         s.bot_settings.show_advanced = !s.bot_settings.show_advanced;
+                    }
+                    BotSettingsField::BotKeepAlive => {
+                        s.bot_settings.bot_keep_alive = !s.bot_settings.bot_keep_alive;
                     }
                     BotSettingsField::FetchFullTransaction => {
                         s.bot_settings.fetch_full_transaction =
@@ -1992,6 +2340,48 @@ async fn run_bot_settings(
                     BotSettingsField::EntryDeadlineMs => {
                         s.bot_settings.entry_deadline_ms.push(c);
                     }
+                    BotSettingsField::CopyTradeWallet => {
+                        s.bot_settings.copy_trade_wallet.push(c);
+                    }
+                    BotSettingsField::CopyTradeScaleBps => {
+                        s.bot_settings.copy_trade_scale_bps.push(c);
+                    }
+                    BotSettingsField::CopyTradeMaxBuySol => {
+                        s.bot_settings.copy_trade_max_buy_sol.push(c);
+                    }
+                    BotSettingsField::MaxOpenPositions => {
+                        s.bot_settings.max_open_positions.push(c);
+                    }
+                    BotSettingsField::MaxBuysPerMint => {
+                        s.bot_settings.max_buys_per_mint.push(c);
+                    }
+                    BotSettingsField::MaxPerMintSol => {
+                        s.bot_settings.max_per_mint_sol.push(c);
+                    }
+                    BotSettingsField::MaxOpenSol => {
+                        s.bot_settings.max_open_sol.push(c);
+                    }
+                    BotSettingsField::DailyLossSol => {
+                        s.bot_settings.daily_loss_sol.push(c);
+                    }
+                    BotSettingsField::CopyTradeMaxBuysPerMint => {
+                        s.bot_settings.copy_trade_max_buys_per_mint.push(c);
+                    }
+                    BotSettingsField::CopyTradeMinSourceBuySol => {
+                        s.bot_settings.copy_trade_min_source_buy_sol.push(c);
+                    }
+                    BotSettingsField::CopyTradeMaxHoldSecs => {
+                        s.bot_settings.copy_trade_max_hold_secs.push(c);
+                    }
+                    BotSettingsField::CopyTradeTakeProfitBps => {
+                        s.bot_settings.copy_trade_take_profit_bps.push(c);
+                    }
+                    BotSettingsField::CopyTradeTakeProfitSellBps => {
+                        s.bot_settings.copy_trade_take_profit_sell_bps.push(c);
+                    }
+                    BotSettingsField::CopyTradeStopLossBps => {
+                        s.bot_settings.copy_trade_stop_loss_bps.push(c);
+                    }
                     BotSettingsField::CreateSlotLag => {
                         s.bot_settings.max_create_event_slot_lag.push(c);
                     }
@@ -2000,8 +2390,13 @@ async fn run_bot_settings(
                         s.bot_settings.confirmation_poll_ms.push(c);
                     }
                     BotSettingsField::Mode
-                    | BotSettingsField::PairScope
+                    | BotSettingsField::Market
+                    | BotSettingsField::CopyTradeEnabled
+                    | BotSettingsField::CopyTradeSizing
+                    | BotSettingsField::CopyTradeBuyPolicy
+                    | BotSettingsField::CopyTradeFollowSells
                     | BotSettingsField::AdvancedToggle
+                    | BotSettingsField::BotKeepAlive
                     | BotSettingsField::FetchFullTransaction
                     | BotSettingsField::CurveExitQuotes
                     | BotSettingsField::ParallelFallbackReads => {}
@@ -2027,6 +2422,48 @@ async fn run_bot_settings(
                     BotSettingsField::EntryDeadlineMs => {
                         s.bot_settings.entry_deadline_ms.pop();
                     }
+                    BotSettingsField::CopyTradeWallet => {
+                        s.bot_settings.copy_trade_wallet.pop();
+                    }
+                    BotSettingsField::CopyTradeScaleBps => {
+                        s.bot_settings.copy_trade_scale_bps.pop();
+                    }
+                    BotSettingsField::CopyTradeMaxBuySol => {
+                        s.bot_settings.copy_trade_max_buy_sol.pop();
+                    }
+                    BotSettingsField::MaxOpenPositions => {
+                        s.bot_settings.max_open_positions.pop();
+                    }
+                    BotSettingsField::MaxBuysPerMint => {
+                        s.bot_settings.max_buys_per_mint.pop();
+                    }
+                    BotSettingsField::MaxPerMintSol => {
+                        s.bot_settings.max_per_mint_sol.pop();
+                    }
+                    BotSettingsField::MaxOpenSol => {
+                        s.bot_settings.max_open_sol.pop();
+                    }
+                    BotSettingsField::DailyLossSol => {
+                        s.bot_settings.daily_loss_sol.pop();
+                    }
+                    BotSettingsField::CopyTradeMaxBuysPerMint => {
+                        s.bot_settings.copy_trade_max_buys_per_mint.pop();
+                    }
+                    BotSettingsField::CopyTradeMinSourceBuySol => {
+                        s.bot_settings.copy_trade_min_source_buy_sol.pop();
+                    }
+                    BotSettingsField::CopyTradeMaxHoldSecs => {
+                        s.bot_settings.copy_trade_max_hold_secs.pop();
+                    }
+                    BotSettingsField::CopyTradeTakeProfitBps => {
+                        s.bot_settings.copy_trade_take_profit_bps.pop();
+                    }
+                    BotSettingsField::CopyTradeTakeProfitSellBps => {
+                        s.bot_settings.copy_trade_take_profit_sell_bps.pop();
+                    }
+                    BotSettingsField::CopyTradeStopLossBps => {
+                        s.bot_settings.copy_trade_stop_loss_bps.pop();
+                    }
                     BotSettingsField::CreateSlotLag => {
                         s.bot_settings.max_create_event_slot_lag.pop();
                     }
@@ -2037,8 +2474,13 @@ async fn run_bot_settings(
                         s.bot_settings.confirmation_poll_ms.pop();
                     }
                     BotSettingsField::Mode
-                    | BotSettingsField::PairScope
+                    | BotSettingsField::Market
+                    | BotSettingsField::CopyTradeEnabled
+                    | BotSettingsField::CopyTradeSizing
+                    | BotSettingsField::CopyTradeBuyPolicy
+                    | BotSettingsField::CopyTradeFollowSells
                     | BotSettingsField::AdvancedToggle
+                    | BotSettingsField::BotKeepAlive
                     | BotSettingsField::FetchFullTransaction
                     | BotSettingsField::CurveExitQuotes
                     | BotSettingsField::ParallelFallbackReads => {}
@@ -2049,12 +2491,43 @@ async fn run_bot_settings(
                     let s = state.read().await;
                     BotSettingsSnapshot {
                         mode: s.bot_settings.mode,
-                        pair_scope: s.bot_settings.pair_scope,
+                        market: s.bot_settings.market,
                         buy_size_sol: s.bot_settings.buy_size_sol.clone(),
                         slippage_bps: s.bot_settings.slippage_bps.clone(),
                         max_hold_secs: s.bot_settings.max_hold_secs.clone(),
                         max_stream_event_age_ms: s.bot_settings.max_stream_event_age_ms.clone(),
                         entry_deadline_ms: s.bot_settings.entry_deadline_ms.clone(),
+                        copy_trade_enabled: s.bot_settings.copy_trade_enabled,
+                        copy_trade_wallet: s.bot_settings.copy_trade_wallet.clone(),
+                        copy_trade_sizing: s.bot_settings.copy_trade_sizing,
+                        copy_trade_scale_bps: s.bot_settings.copy_trade_scale_bps.clone(),
+                        copy_trade_max_buy_sol: s.bot_settings.copy_trade_max_buy_sol.clone(),
+                        copy_trade_follow_sells: s.bot_settings.copy_trade_follow_sells,
+                        bot_keep_alive: s.bot_settings.bot_keep_alive,
+                        max_open_positions: s.bot_settings.max_open_positions.clone(),
+                        max_buys_per_mint: s.bot_settings.max_buys_per_mint.clone(),
+                        max_per_mint_sol: s.bot_settings.max_per_mint_sol.clone(),
+                        max_open_sol: s.bot_settings.max_open_sol.clone(),
+                        daily_loss_sol: s.bot_settings.daily_loss_sol.clone(),
+                        copy_trade_buy_policy: s.bot_settings.copy_trade_buy_policy,
+                        copy_trade_max_buys_per_mint: s
+                            .bot_settings
+                            .copy_trade_max_buys_per_mint
+                            .clone(),
+                        copy_trade_min_source_buy_sol: s
+                            .bot_settings
+                            .copy_trade_min_source_buy_sol
+                            .clone(),
+                        copy_trade_max_hold_secs: s.bot_settings.copy_trade_max_hold_secs.clone(),
+                        copy_trade_take_profit_bps: s
+                            .bot_settings
+                            .copy_trade_take_profit_bps
+                            .clone(),
+                        copy_trade_take_profit_sell_bps: s
+                            .bot_settings
+                            .copy_trade_take_profit_sell_bps
+                            .clone(),
+                        copy_trade_stop_loss_bps: s.bot_settings.copy_trade_stop_loss_bps.clone(),
                         max_create_event_slot_lag: s.bot_settings.max_create_event_slot_lag.clone(),
                         backfill_limit: s.bot_settings.backfill_limit.clone(),
                         fetch_full_transaction: s.bot_settings.fetch_full_transaction,
@@ -2098,12 +2571,46 @@ fn load_bot_settings_state(config_path: &std::path::Path) -> BotSettingsState {
     match Config::load_raw(&resolved) {
         Ok(cfg) => {
             state.mode = cfg.mode;
-            state.pair_scope = cfg.pair_scope;
+            state.market = cfg.market;
             state.buy_size_sol = format!("{:.4}", cfg.base_buy_lamports as f64 / 1_000_000_000.0);
             state.slippage_bps = cfg.max_slippage_bps.to_string();
             state.max_hold_secs = cfg.max_hold_seconds.to_string();
             state.max_stream_event_age_ms = cfg.max_stream_event_age_ms.to_string();
             state.entry_deadline_ms = cfg.entry_deadline_ms.to_string();
+            state.copy_trade_enabled = cfg.copy_trade_enabled;
+            state.copy_trade_wallet = cfg.copy_trade_wallet.clone();
+            state.copy_trade_sizing = cfg.copy_trade_sizing;
+            state.copy_trade_scale_bps = cfg.copy_trade_scale_bps.to_string();
+            state.copy_trade_max_buy_sol = format!(
+                "{:.4}",
+                cfg.copy_trade_max_buy_lamports as f64 / 1_000_000_000.0
+            );
+            state.copy_trade_follow_sells = cfg.copy_trade_follow_sells;
+            state.bot_keep_alive = cfg.bot_keep_alive;
+            state.max_open_positions = cfg.max_open_positions.to_string();
+            state.max_buys_per_mint = cfg.max_buys_per_mint.to_string();
+            state.max_per_mint_sol = format!(
+                "{:.4}",
+                cfg.max_total_lamports_per_mint as f64 / 1_000_000_000.0
+            );
+            state.max_open_sol = format!(
+                "{:.4}",
+                cfg.max_total_open_lamports as f64 / 1_000_000_000.0
+            );
+            state.daily_loss_sol = format!(
+                "{:.4}",
+                cfg.max_daily_loss_lamports as f64 / 1_000_000_000.0
+            );
+            state.copy_trade_buy_policy = cfg.copy_trade_buy_policy;
+            state.copy_trade_max_buys_per_mint = cfg.copy_trade_max_buys_per_mint.to_string();
+            state.copy_trade_min_source_buy_sol = format!(
+                "{:.4}",
+                cfg.copy_trade_min_source_buy_lamports as f64 / 1_000_000_000.0
+            );
+            state.copy_trade_max_hold_secs = cfg.copy_trade_max_hold_seconds.to_string();
+            state.copy_trade_take_profit_bps = cfg.copy_trade_take_profit_bps.to_string();
+            state.copy_trade_take_profit_sell_bps = cfg.copy_trade_take_profit_sell_bps.to_string();
+            state.copy_trade_stop_loss_bps = cfg.copy_trade_stop_loss_bps.to_string();
             state.max_create_event_slot_lag = cfg.max_create_event_slot_lag.to_string();
             state.backfill_limit = cfg.backfill_limit.to_string();
             state.fetch_full_transaction = cfg.fetch_full_transaction;
@@ -2113,12 +2620,46 @@ fn load_bot_settings_state(config_path: &std::path::Path) -> BotSettingsState {
         Err(err) => {
             let cfg = Config::default();
             state.mode = cfg.mode;
-            state.pair_scope = cfg.pair_scope;
+            state.market = cfg.market;
             state.buy_size_sol = format!("{:.4}", cfg.base_buy_lamports as f64 / 1_000_000_000.0);
             state.slippage_bps = cfg.max_slippage_bps.to_string();
             state.max_hold_secs = cfg.max_hold_seconds.to_string();
             state.max_stream_event_age_ms = cfg.max_stream_event_age_ms.to_string();
             state.entry_deadline_ms = cfg.entry_deadline_ms.to_string();
+            state.copy_trade_enabled = cfg.copy_trade_enabled;
+            state.copy_trade_wallet = cfg.copy_trade_wallet.clone();
+            state.copy_trade_sizing = cfg.copy_trade_sizing;
+            state.copy_trade_scale_bps = cfg.copy_trade_scale_bps.to_string();
+            state.copy_trade_max_buy_sol = format!(
+                "{:.4}",
+                cfg.copy_trade_max_buy_lamports as f64 / 1_000_000_000.0
+            );
+            state.copy_trade_follow_sells = cfg.copy_trade_follow_sells;
+            state.bot_keep_alive = cfg.bot_keep_alive;
+            state.max_open_positions = cfg.max_open_positions.to_string();
+            state.max_buys_per_mint = cfg.max_buys_per_mint.to_string();
+            state.max_per_mint_sol = format!(
+                "{:.4}",
+                cfg.max_total_lamports_per_mint as f64 / 1_000_000_000.0
+            );
+            state.max_open_sol = format!(
+                "{:.4}",
+                cfg.max_total_open_lamports as f64 / 1_000_000_000.0
+            );
+            state.daily_loss_sol = format!(
+                "{:.4}",
+                cfg.max_daily_loss_lamports as f64 / 1_000_000_000.0
+            );
+            state.copy_trade_buy_policy = cfg.copy_trade_buy_policy;
+            state.copy_trade_max_buys_per_mint = cfg.copy_trade_max_buys_per_mint.to_string();
+            state.copy_trade_min_source_buy_sol = format!(
+                "{:.4}",
+                cfg.copy_trade_min_source_buy_lamports as f64 / 1_000_000_000.0
+            );
+            state.copy_trade_max_hold_secs = cfg.copy_trade_max_hold_seconds.to_string();
+            state.copy_trade_take_profit_bps = cfg.copy_trade_take_profit_bps.to_string();
+            state.copy_trade_take_profit_sell_bps = cfg.copy_trade_take_profit_sell_bps.to_string();
+            state.copy_trade_stop_loss_bps = cfg.copy_trade_stop_loss_bps.to_string();
             state.max_create_event_slot_lag = cfg.max_create_event_slot_lag.to_string();
             state.backfill_limit = cfg.backfill_limit.to_string();
             state.fetch_full_transaction = cfg.fetch_full_transaction;
@@ -2142,14 +2683,67 @@ fn env_bool_lookup(legacy_name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn toml_sol_or_lamports(
+    table: &toml::Table,
+    sol_key: &str,
+    lamports_key: &str,
+    default_lamports: u64,
+) -> u64 {
+    if let Some(value) = table.get(sol_key) {
+        let sol = value
+            .as_float()
+            .or_else(|| value.as_integer().map(|v| v as f64))
+            .or_else(|| value.as_str().and_then(|v| v.parse::<f64>().ok()));
+        if let Some(sol) = sol.filter(|v| v.is_finite() && *v >= 0.0) {
+            return (sol * 1_000_000_000.0).round() as u64;
+        }
+    }
+    table
+        .get(lamports_key)
+        .and_then(|v| v.as_integer())
+        .filter(|v| *v >= 0)
+        .map(|v| v as u64)
+        .unwrap_or(default_lamports)
+}
+
+fn format_sol(value: f64) -> String {
+    let mut out = format!("{value:.9}");
+    while out.contains('.') && out.ends_with('0') {
+        out.pop();
+    }
+    if out.ends_with('.') {
+        out.push('0');
+    }
+    out
+}
+
 struct BotSettingsSnapshot {
     mode: Mode,
-    pair_scope: PairScope,
+    market: Market,
     buy_size_sol: String,
     slippage_bps: String,
     max_hold_secs: String,
     max_stream_event_age_ms: String,
     entry_deadline_ms: String,
+    copy_trade_enabled: bool,
+    copy_trade_wallet: String,
+    copy_trade_sizing: CopyTradeSizing,
+    copy_trade_scale_bps: String,
+    copy_trade_max_buy_sol: String,
+    copy_trade_follow_sells: bool,
+    bot_keep_alive: bool,
+    max_open_positions: String,
+    max_buys_per_mint: String,
+    max_per_mint_sol: String,
+    max_open_sol: String,
+    daily_loss_sol: String,
+    copy_trade_buy_policy: CopyTradeBuyPolicy,
+    copy_trade_max_buys_per_mint: String,
+    copy_trade_min_source_buy_sol: String,
+    copy_trade_max_hold_secs: String,
+    copy_trade_take_profit_bps: String,
+    copy_trade_take_profit_sell_bps: String,
+    copy_trade_stop_loss_bps: String,
     max_create_event_slot_lag: String,
     backfill_limit: String,
     fetch_full_transaction: bool,
@@ -2213,6 +2807,146 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
         bail!("buy deadline must be greater than 0 ms");
     }
 
+    let copy_trade_wallet = vals.copy_trade_wallet.trim();
+    if vals.copy_trade_enabled {
+        if copy_trade_wallet.is_empty() {
+            bail!("copy trade wallet is required when copy trade is on");
+        }
+        copy_trade_wallet
+            .parse::<solana_pubkey::Pubkey>()
+            .context("copy trade wallet is not a valid Solana pubkey")?;
+    } else if !copy_trade_wallet.is_empty() {
+        copy_trade_wallet
+            .parse::<solana_pubkey::Pubkey>()
+            .context("copy trade wallet is not a valid Solana pubkey")?;
+    }
+
+    let copy_trade_scale_bps: u32 = vals
+        .copy_trade_scale_bps
+        .trim()
+        .parse()
+        .context("copy trade scale is not a valid integer (bps)")?;
+    if copy_trade_scale_bps == 0 {
+        bail!("copy trade scale must be greater than 0 bps");
+    }
+
+    let copy_trade_max_buy_sol: f64 = vals
+        .copy_trade_max_buy_sol
+        .trim()
+        .parse()
+        .context("copy trade max buy is not a valid SOL number")?;
+    if copy_trade_max_buy_sol <= 0.0 {
+        bail!("copy trade max buy must be positive");
+    }
+    let copy_trade_max_buy_lamports = (copy_trade_max_buy_sol * 1_000_000_000.0).round() as u64;
+    if copy_trade_max_buy_lamports == 0 {
+        bail!("copy trade max buy is too small");
+    }
+
+    let max_open_positions: usize = vals
+        .max_open_positions
+        .trim()
+        .parse()
+        .context("max open positions is not a valid integer")?;
+    if max_open_positions == 0 {
+        bail!("max open positions must be greater than 0");
+    }
+
+    let max_buys_per_mint: u32 = vals
+        .max_buys_per_mint
+        .trim()
+        .parse()
+        .context("max buys per mint is not a valid integer")?;
+    if max_buys_per_mint == 0 {
+        bail!("max buys per mint must be greater than 0");
+    }
+
+    let parse_positive_sol_lamports = |raw: &str, label: &str| -> Result<u64> {
+        let value: f64 = raw
+            .trim()
+            .parse()
+            .with_context(|| format!("{label} is not a valid SOL number"))?;
+        if !value.is_finite() || value <= 0.0 {
+            bail!("{label} must be positive");
+        }
+        let lamports = (value * 1_000_000_000.0).round() as u64;
+        if lamports == 0 {
+            bail!("{label} is too small");
+        }
+        Ok(lamports)
+    };
+
+    let max_total_lamports_per_mint =
+        parse_positive_sol_lamports(&vals.max_per_mint_sol, "per-mint cap")?;
+    if max_total_lamports_per_mint < lamports {
+        bail!("per-mint cap must be at least the buy size");
+    }
+
+    let max_total_open_lamports =
+        parse_positive_sol_lamports(&vals.max_open_sol, "open exposure cap")?;
+    if max_total_open_lamports < lamports {
+        bail!("open exposure cap must be at least the buy size");
+    }
+
+    let _max_daily_loss_lamports =
+        parse_positive_sol_lamports(&vals.daily_loss_sol, "daily loss limit")? as i64;
+
+    let copy_trade_max_buys_per_mint: u32 = vals
+        .copy_trade_max_buys_per_mint
+        .trim()
+        .parse()
+        .context("copy trade max buys is not a valid integer")?;
+    if copy_trade_max_buys_per_mint == 0 {
+        bail!("copy trade max buys must be greater than 0");
+    }
+
+    let copy_trade_min_source_buy_sol: f64 = vals
+        .copy_trade_min_source_buy_sol
+        .trim()
+        .parse()
+        .context("copy trade min source buy is not a valid SOL number")?;
+    if copy_trade_min_source_buy_sol < 0.0 {
+        bail!("copy trade min source buy cannot be negative");
+    }
+    let _copy_trade_min_source_buy_lamports =
+        (copy_trade_min_source_buy_sol * 1_000_000_000.0).round() as u64;
+
+    let copy_trade_max_hold_seconds: i64 = vals
+        .copy_trade_max_hold_secs
+        .trim()
+        .parse()
+        .context("copy trade max hold is not a valid integer (seconds)")?;
+    if copy_trade_max_hold_seconds <= 0 {
+        bail!("copy trade max hold must be greater than 0 seconds");
+    }
+
+    let copy_trade_take_profit_bps: i64 = vals
+        .copy_trade_take_profit_bps
+        .trim()
+        .parse()
+        .context("copy trade take profit is not a valid integer (bps)")?;
+    if copy_trade_take_profit_bps < 0 {
+        bail!("copy trade take profit cannot be negative");
+    }
+
+    let copy_trade_take_profit_sell_bps: u32 = vals
+        .copy_trade_take_profit_sell_bps
+        .trim()
+        .parse()
+        .context("copy trade take profit sell is not a valid integer (bps)")?;
+    if copy_trade_take_profit_sell_bps == 0 || copy_trade_take_profit_sell_bps > 10_000 {
+        bail!("copy trade take profit sell must be between 1 and 10000 bps");
+    }
+
+    let copy_trade_stop_loss_bps: i64 = vals
+        .copy_trade_stop_loss_bps
+        .trim()
+        .parse()
+        .context("copy trade stop loss is not a valid integer (bps)")?;
+    if copy_trade_stop_loss_bps < 0 {
+        bail!("copy trade stop loss cannot be negative");
+    }
+
     let max_create_event_slot_lag: u64 = vals
         .max_create_event_slot_lag
         .trim()
@@ -2237,8 +2971,7 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
         bail!("confirmation poll must be greater than 0 ms");
     }
 
-    let content = std::fs::read_to_string(config_path)
-        .with_context(|| format!("read config {config_path:?}"))?;
+    let content = read_config_or_default(config_path)?;
     let mut table: toml::Table = content
         .parse()
         .with_context(|| format!("parse config {config_path:?}"))?;
@@ -2247,14 +2980,13 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
         "mode".to_string(),
         toml::Value::String(vals.mode.as_str().to_string()),
     );
+    table.remove("pair_scope");
     table.insert(
-        "pair_scope".to_string(),
-        toml::Value::String(vals.pair_scope.as_str().to_string()),
+        "market".to_string(),
+        toml::Value::String(vals.market.as_str().to_string()),
     );
-    table.insert(
-        "base_buy_lamports".to_string(),
-        toml::Value::Integer(lamports as i64),
-    );
+    table.remove("base_buy_lamports");
+    table.insert("base_buy_sol".to_string(), toml::Value::Float(sol));
     table.insert(
         "max_slippage_bps".to_string(),
         toml::Value::Integer(slippage_bps as i64),
@@ -2270,6 +3002,87 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
     table.insert(
         "entry_deadline_ms".to_string(),
         toml::Value::Integer(entry_deadline_ms),
+    );
+    table.insert(
+        "copy_trade_enabled".to_string(),
+        toml::Value::Boolean(vals.copy_trade_enabled),
+    );
+    table.insert(
+        "copy_trade_wallet".to_string(),
+        toml::Value::String(copy_trade_wallet.to_string()),
+    );
+    table.insert(
+        "copy_trade_sizing".to_string(),
+        toml::Value::String(vals.copy_trade_sizing.as_str().to_string()),
+    );
+    table.insert(
+        "copy_trade_scale_bps".to_string(),
+        toml::Value::Integer(copy_trade_scale_bps as i64),
+    );
+    table.remove("copy_trade_max_buy_lamports");
+    table.insert(
+        "copy_trade_max_buy_sol".to_string(),
+        toml::Value::Float(copy_trade_max_buy_sol),
+    );
+    table.insert(
+        "copy_trade_buy_policy".to_string(),
+        toml::Value::String(vals.copy_trade_buy_policy.as_str().to_string()),
+    );
+    table.insert(
+        "copy_trade_max_buys_per_mint".to_string(),
+        toml::Value::Integer(copy_trade_max_buys_per_mint as i64),
+    );
+    table.remove("copy_trade_min_source_buy_lamports");
+    table.insert(
+        "copy_trade_min_source_buy_sol".to_string(),
+        toml::Value::Float(copy_trade_min_source_buy_sol),
+    );
+    table.insert(
+        "copy_trade_max_hold_seconds".to_string(),
+        toml::Value::Integer(copy_trade_max_hold_seconds),
+    );
+    table.insert(
+        "copy_trade_take_profit_bps".to_string(),
+        toml::Value::Integer(copy_trade_take_profit_bps),
+    );
+    table.insert(
+        "copy_trade_take_profit_sell_bps".to_string(),
+        toml::Value::Integer(copy_trade_take_profit_sell_bps as i64),
+    );
+    table.insert(
+        "copy_trade_stop_loss_bps".to_string(),
+        toml::Value::Integer(copy_trade_stop_loss_bps),
+    );
+    table.insert(
+        "copy_trade_follow_sells".to_string(),
+        toml::Value::Boolean(vals.copy_trade_follow_sells),
+    );
+    table.insert(
+        "bot_keep_alive".to_string(),
+        toml::Value::Boolean(vals.bot_keep_alive),
+    );
+    table.insert(
+        "max_open_positions".to_string(),
+        toml::Value::Integer(max_open_positions as i64),
+    );
+    table.insert(
+        "max_buys_per_mint".to_string(),
+        toml::Value::Integer(max_buys_per_mint as i64),
+    );
+    table.remove("max_total_lamports_per_mint");
+    table.insert(
+        "max_total_sol_per_mint".to_string(),
+        toml::Value::Float(vals.max_per_mint_sol.trim().parse::<f64>().unwrap_or(0.0)),
+    );
+    table.remove("max_total_open_lamports");
+    table.insert(
+        "max_total_open_sol".to_string(),
+        toml::Value::Float(vals.max_open_sol.trim().parse::<f64>().unwrap_or(0.0)),
+    );
+    table.remove("max_daily_loss_lamports");
+    table.insert(
+        "max_daily_loss_sol".to_string(),
+        toml::Value::Float(vals.daily_loss_sol.trim().parse::<f64>().unwrap_or(0.0)),
     );
     table.insert(
         "max_create_event_slot_lag".to_string(),
@@ -2313,9 +3126,9 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
     }
 
     let env_values = vec![
-        ("PAIR_SCOPE", vals.pair_scope.as_str().to_string()),
-        ("LIVE_PAIR_SCOPE", vals.pair_scope.as_str().to_string()),
-        ("LIVE_BASE_BUY_LAMPORTS", lamports.to_string()),
+        ("MARKET", vals.market.as_str().to_string()),
+        ("LIVE_MARKET", vals.market.as_str().to_string()),
+        ("LIVE_BASE_BUY_SOL", format_sol(sol)),
         ("LIVE_MAX_SLIPPAGE_BPS", slippage_bps.to_string()),
         ("LIVE_MAX_HOLD_SECONDS", max_hold_secs.to_string()),
         (
@@ -2323,6 +3136,70 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
             max_stream_event_age_ms.to_string(),
         ),
         ("LIVE_ENTRY_DEADLINE_MS", entry_deadline_ms.to_string()),
+        (
+            "LIVE_COPY_TRADE_ENABLED",
+            vals.copy_trade_enabled.to_string(),
+        ),
+        ("LIVE_COPY_TRADE_WALLET", copy_trade_wallet.to_string()),
+        (
+            "LIVE_COPY_TRADE_SIZING",
+            vals.copy_trade_sizing.as_str().to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_SCALE_BPS",
+            copy_trade_scale_bps.to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_MAX_BUY_SOL",
+            format_sol(copy_trade_max_buy_sol),
+        ),
+        (
+            "LIVE_COPY_TRADE_BUY_POLICY",
+            vals.copy_trade_buy_policy.as_str().to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_MAX_BUYS_PER_MINT",
+            copy_trade_max_buys_per_mint.to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_MIN_SOURCE_BUY_SOL",
+            format_sol(copy_trade_min_source_buy_sol),
+        ),
+        (
+            "LIVE_COPY_TRADE_MAX_HOLD_SECONDS",
+            copy_trade_max_hold_seconds.to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_TAKE_PROFIT_BPS",
+            copy_trade_take_profit_bps.to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_TAKE_PROFIT_SELL_BPS",
+            copy_trade_take_profit_sell_bps.to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_STOP_LOSS_BPS",
+            copy_trade_stop_loss_bps.to_string(),
+        ),
+        (
+            "LIVE_COPY_TRADE_FOLLOW_SELLS",
+            vals.copy_trade_follow_sells.to_string(),
+        ),
+        ("LIVE_BOT_KEEP_ALIVE", vals.bot_keep_alive.to_string()),
+        ("LIVE_MAX_OPEN_POSITIONS", max_open_positions.to_string()),
+        ("LIVE_MAX_BUYS_PER_MINT", max_buys_per_mint.to_string()),
+        (
+            "LIVE_MAX_TOTAL_SOL_PER_MINT",
+            format_sol(vals.max_per_mint_sol.trim().parse::<f64>().unwrap_or(0.0)),
+        ),
+        (
+            "LIVE_MAX_TOTAL_OPEN_SOL",
+            format_sol(vals.max_open_sol.trim().parse::<f64>().unwrap_or(0.0)),
+        ),
+        (
+            "LIVE_MAX_DAILY_LOSS_SOL",
+            format_sol(vals.daily_loss_sol.trim().parse::<f64>().unwrap_or(0.0)),
+        ),
         (
             "LIVE_MAX_CREATE_EVENT_SLOT_LAG",
             max_create_event_slot_lag.to_string(),
@@ -2358,14 +3235,20 @@ fn save_bot_settings(config_path: &std::path::Path, vals: &BotSettingsSnapshot) 
     };
 
     Ok(format!(
-        "saved auto bot mode={} pair_scope={} buy_lamports={} slippage_bps={} hold_s={} age_ms={} deadline_ms={}{}{}",
+        "saved auto bot mode={} market={} buy_sol={} slippage_bps={} hold_s={} age_ms={} deadline_ms={} caps={}/{} per_mint_sol={} open_sol={} daily_loss_sol={} copy_trade={}{}{}",
         vals.mode.as_str(),
-        vals.pair_scope.as_str(),
-        lamports,
+        vals.market.as_str(),
+        format_sol(sol),
         slippage_bps,
         max_hold_secs,
         max_stream_event_age_ms,
         entry_deadline_ms,
+        max_open_positions,
+        max_buys_per_mint,
+        format_sol(vals.max_per_mint_sol.trim().parse::<f64>().unwrap_or(0.0)),
+        format_sol(vals.max_open_sol.trim().parse::<f64>().unwrap_or(0.0)),
+        format_sol(vals.daily_loss_sol.trim().parse::<f64>().unwrap_or(0.0)),
+        if vals.copy_trade_enabled { "on" } else { "off" },
         env_note
             .map(|p| format!(" and {p:?}"))
             .unwrap_or_default(),
@@ -2435,10 +3318,34 @@ fn update_bot_env_file(
 }
 
 fn matches_env_suffix(trimmed: &str, suffix: &str) -> bool {
+    let suffixes: &[&str] = match suffix {
+        "MARKET" => &["MARKET", "PAIR_SCOPE"],
+        "LIVE_MARKET" => &["LIVE_MARKET", "LIVE_PAIR_SCOPE"],
+        "LIVE_BASE_BUY_SOL" => &["LIVE_BASE_BUY_SOL", "LIVE_BASE_BUY_LAMPORTS"],
+        "LIVE_MAX_BALANCE_SOL" => &["LIVE_MAX_BALANCE_SOL", "LIVE_MAX_BALANCE_LAMPORTS"],
+        "LIVE_MAX_TOTAL_SOL_PER_MINT" => &[
+            "LIVE_MAX_TOTAL_SOL_PER_MINT",
+            "LIVE_MAX_TOTAL_LAMPORTS_PER_MINT",
+        ],
+        "LIVE_MAX_TOTAL_OPEN_SOL" => &["LIVE_MAX_TOTAL_OPEN_SOL", "LIVE_MAX_TOTAL_OPEN_LAMPORTS"],
+        "LIVE_MAX_DAILY_LOSS_SOL" => &["LIVE_MAX_DAILY_LOSS_SOL", "LIVE_MAX_DAILY_LOSS_LAMPORTS"],
+        "LIVE_COPY_TRADE_MAX_BUY_SOL" => &[
+            "LIVE_COPY_TRADE_MAX_BUY_SOL",
+            "LIVE_COPY_TRADE_MAX_BUY_LAMPORTS",
+        ],
+        "LIVE_COPY_TRADE_MIN_SOURCE_BUY_SOL" => &[
+            "LIVE_COPY_TRADE_MIN_SOURCE_BUY_SOL",
+            "LIVE_COPY_TRADE_MIN_SOURCE_BUY_LAMPORTS",
+        ],
+        "LIVE_JITO_TIP_SOL" => &["LIVE_JITO_TIP_SOL", "LIVE_JITO_TIP_LAMPORTS"],
+        _ => std::slice::from_ref(&suffix),
+    };
     for prefix in ["CTARNITH_", "MAYHEM_"] {
         for lead in ["export ", ""] {
-            if trimmed.starts_with(&format!("{lead}{prefix}{suffix}=")) {
-                return true;
+            for candidate_suffix in suffixes {
+                if trimmed.starts_with(&format!("{lead}{prefix}{candidate_suffix}=")) {
+                    return true;
+                }
             }
         }
     }
@@ -2481,113 +3388,169 @@ async fn run_bot_mode(
                 s.last_error = Some(msg.to_string());
                 let _ = event_tx.send(ScanEvent::StateChanged);
             }
-            wait_esc_in_bot_stopped(cmd_rx, event_tx).await;
+            wait_esc_in_bot_stopped(&state, cmd_rx, event_tx).await;
             return false;
         }
     };
 
     let launch_label = launch.label();
-    let mut cmd = launch.command(&config_arg, &bot_cwd);
-    cmd.env("CTARNITH_LIVE_CONFIG", config_arg.as_os_str())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(err) => {
-            let msg = format!("failed to spawn bot: {err:#}");
-            let _ = event_tx.send(ScanEvent::Log(msg.clone()));
-            {
-                let mut s = state.write().await;
-                s.push_log(msg.clone());
-                s.phase = Phase::BotStopped;
-                s.last_error = Some(msg);
-                let _ = event_tx.send(ScanEvent::StateChanged);
-            }
-            wait_esc_in_bot_stopped(cmd_rx, event_tx).await;
-            return false;
-        }
-    };
-
-    {
-        let mut s = state.write().await;
-        s.push_log(launch_label);
-        s.push_log("waiting for stream subscriptions…".to_string());
-    }
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
-    let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
-
-    let mut stopped = false;
+    let keep_alive = Config::load_raw(&config_arg)
+        .map(|cfg| cfg.bot_keep_alive)
+        .unwrap_or(true);
     let mut quit = false;
+    let mut intentional_stop = false;
+    let mut restart_count = 0u32;
 
-    while !stopped {
-        tokio::select! {
-            line = stdout_lines.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        if let Some(cleaned) = clean_bot_log_line(&l) {
-                            if is_bot_execution_log(&cleaned) {
-                                let _ = event_tx.send(ScanEvent::Log(cleaned));
+    loop {
+        let mut cmd = launch.command(&config_arg, &bot_cwd);
+        cmd.env("CTARNITH_LIVE_CONFIG", config_arg.as_os_str())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(err) => {
+                let msg = format!("failed to spawn bot: {err:#}");
+                let _ = event_tx.send(ScanEvent::Log(msg.clone()));
+                {
+                    let mut s = state.write().await;
+                    s.push_log(msg.clone());
+                    s.phase = Phase::BotStopped;
+                    s.last_error = Some(msg);
+                    let _ = event_tx.send(ScanEvent::StateChanged);
+                }
+                wait_esc_in_bot_stopped(&state, cmd_rx, event_tx).await;
+                return false;
+            }
+        };
+        let child_started_at = Instant::now();
+
+        {
+            let mut s = state.write().await;
+            s.phase = Phase::BotRunning;
+            s.push_log(if restart_count == 0 {
+                launch_label.clone()
+            } else {
+                format!("bot restarted #{restart_count}: {launch_label}")
+            });
+            s.push_log("waiting for stream subscriptions…".to_string());
+            let _ = event_tx.send(ScanEvent::StateChanged);
+        }
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let mut stdout_lines = tokio::io::BufReader::new(stdout).lines();
+        let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
+        let mut child_tail = VecDeque::<String>::with_capacity(BOT_CHILD_TAIL);
+
+        let mut stopped = false;
+
+        while !stopped {
+            tokio::select! {
+                line = stdout_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => {
+                            if let Some(cleaned) = clean_bot_log_line(&l) {
+                                remember_bot_child_line(&mut child_tail, &cleaned);
+                                if is_bot_execution_log(&cleaned) || is_bot_fatal_log(&cleaned) {
+                                    let _ = event_tx.send(ScanEvent::Log(cleaned));
+                                }
                             }
                         }
-                    }
-                    Ok(None) => stopped = true,
-                    Err(e) => {
-                        let _ = event_tx.send(ScanEvent::Log(format!("stdout error: {e}")));
-                        stopped = true;
-                    }
-                }
-            }
-            line = stderr_lines.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        if let Some(cleaned) = clean_bot_log_line(&l) {
-                            if is_bot_execution_log(&cleaned) {
-                                let _ = event_tx.send(ScanEvent::Log(cleaned));
-                            }
+                        Ok(None) => stopped = true,
+                        Err(e) => {
+                            let _ = event_tx.send(ScanEvent::Log(format!("stdout error: {e}")));
+                            stopped = true;
                         }
                     }
-                    Ok(None) => stopped = true,
-                    Err(e) => {
-                        let _ = event_tx.send(ScanEvent::Log(format!("stderr error: {e}")));
-                        stopped = true;
+                }
+                line = stderr_lines.next_line() => {
+                    match line {
+                        Ok(Some(l)) => {
+                            if let Some(cleaned) = clean_bot_log_line(&l) {
+                                remember_bot_child_line(&mut child_tail, &cleaned);
+                                if is_bot_execution_log(&cleaned) || is_bot_fatal_log(&cleaned) {
+                                    let _ = event_tx.send(ScanEvent::Log(cleaned));
+                                }
+                            }
+                        }
+                        Ok(None) => stopped = true,
+                        Err(e) => {
+                            let _ = event_tx.send(ScanEvent::Log(format!("stderr error: {e}")));
+                            stopped = true;
+                        }
                     }
                 }
-            }
-            cmd = recv_mapped_command(cmd_rx, Phase::BotRunning) => {
-                match cmd {
-                    Some(ScanCommand::Cancel) => {
-                        let _ = event_tx.send(ScanEvent::Log("[esc] stopping bot…".into()));
-                        let _ = child.kill().await;
-                        stopped = true;
+                cmd = recv_mapped_command(cmd_rx, Phase::BotRunning) => {
+                    match cmd {
+                        Some(ScanCommand::Cancel) => {
+                            if close_log_overlay_if_open(&state, event_tx).await {
+                                continue;
+                            }
+                            let _ = event_tx.send(ScanEvent::Log("[esc] stopping bot…".into()));
+                            let _ = child.kill().await;
+                            intentional_stop = true;
+                            stopped = true;
+                        }
+                        Some(ScanCommand::Quit) => {
+                            let _ = event_tx.send(ScanEvent::Log("[q] quitting…".into()));
+                            let _ = child.kill().await;
+                            intentional_stop = true;
+                            stopped = true;
+                            quit = true;
+                        }
+                        Some(ScanCommand::ShowLogs) => {
+                            let _ = event_tx.send(ScanEvent::ToggleLogs);
+                        }
+                        Some(ScanCommand::ScrollLogs(delta)) => {
+                            let _ = event_tx.send(ScanEvent::ScrollLogs(delta));
+                        }
+                        Some(ScanCommand::CycleTheme) => {
+                            let mut s = state.write().await;
+                            s.theme = s.theme.cycle();
+                            let _ = event_tx.send(ScanEvent::Log(format!(
+                                "theme cycled -> {}",
+                                s.theme.label()
+                            )));
+                        }
+                        _ => {}
                     }
-                    Some(ScanCommand::Quit) => {
-                        let _ = event_tx.send(ScanEvent::Log("[q] quitting…".into()));
-                        let _ = child.kill().await;
-                        stopped = true;
-                        quit = true;
-                    }
-                    Some(ScanCommand::ShowLogs) => {
-                        let _ = event_tx.send(ScanEvent::ToggleLogs);
-                    }
-                    Some(ScanCommand::CycleTheme) => {
-                        let mut s = state.write().await;
-                        s.theme = s.theme.cycle();
-                        let _ = event_tx.send(ScanEvent::Log(format!(
-                            "theme cycled -> {}",
-                            s.theme.label()
-                        )));
-                    }
-                    _ => {}
                 }
             }
         }
-    }
 
-    let _ = child.wait().await;
+        let status = child.wait().await.ok();
+        if quit || intentional_stop {
+            break;
+        }
+        if keep_alive {
+            restart_count = restart_count.saturating_add(1);
+            let failed = status_failed(status.as_ref());
+            if failed {
+                emit_bot_exit_diagnostics(event_tx, status.as_ref(), &child_tail);
+            }
+            let rapid_failure = failed && child_started_at.elapsed() <= BOT_RAPID_FAILURE_WINDOW;
+            if rapid_failure && restart_count >= BOT_RAPID_FAILURE_LIMIT {
+                let msg = format!(
+                    "bot stopped after {restart_count} rapid startup failures; fix the last bot error and start Auto Bot again"
+                );
+                let _ = event_tx.send(ScanEvent::Log(msg.clone()));
+                {
+                    let mut s = state.write().await;
+                    s.last_error = Some(msg);
+                    let _ = event_tx.send(ScanEvent::StateChanged);
+                }
+                break;
+            }
+            let _ = event_tx.send(ScanEvent::Log(format!(
+                "bot exited unexpectedly status={status:?}; restarting in 2s"
+            )));
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        let _ = event_tx.send(ScanEvent::Log(format!("bot exited status={status:?}")));
+        break;
+    }
     {
         let mut s = state.write().await;
         s.phase = Phase::BotStopped;
@@ -2598,19 +3561,29 @@ async fn run_bot_mode(
         return true;
     }
 
-    wait_esc_in_bot_stopped(cmd_rx, event_tx).await;
+    wait_esc_in_bot_stopped(&state, cmd_rx, event_tx).await;
     false
 }
 
 async fn wait_esc_in_bot_stopped(
+    state: &Arc<RwLock<ScanState>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<ScanCommand>,
     event_tx: &mpsc::UnboundedSender<ScanEvent>,
 ) {
     loop {
         match recv_mapped_command(cmd_rx, Phase::BotStopped).await {
-            Some(ScanCommand::Cancel) | Some(ScanCommand::Quit) => break,
+            Some(ScanCommand::Cancel) => {
+                if close_log_overlay_if_open(state, event_tx).await {
+                    continue;
+                }
+                break;
+            }
+            Some(ScanCommand::Quit) => break,
             Some(ScanCommand::ShowLogs) => {
                 let _ = event_tx.send(ScanEvent::ToggleLogs);
+            }
+            Some(ScanCommand::ScrollLogs(delta)) => {
+                let _ = event_tx.send(ScanEvent::ScrollLogs(delta));
             }
             _ => {}
         }
@@ -2632,6 +3605,7 @@ async fn run_settings(
     // for the env-only vars, from the process environment.
     let (
         buy_size_sol,
+        market,
         helius_key,
         slippage_bps,
         max_hold_secs,
@@ -2641,18 +3615,29 @@ async fn run_settings(
         sell_slippage_bps,
         priority_fee_microlamports,
         jito_block_engine_url,
-        jito_tip_lamports,
+        jito_tip_sol,
         confirmation_poll_ms,
         pre_broadcast_simulation,
     ) = {
         let content = std::fs::read_to_string(config_path).unwrap_or_default();
         let table: toml::Table = content.parse().unwrap_or_default();
         let live_table = table.get("live").and_then(|v| v.as_table());
-        let lamports = table
-            .get("base_buy_lamports")
-            .and_then(|v| v.as_integer())
-            .unwrap_or(13_025_001) as u64;
+        let lamports =
+            toml_sol_or_lamports(&table, "base_buy_sol", "base_buy_lamports", 13_025_001);
         let buy_size_sol = format!("{:.4}", lamports as f64 / 1_000_000_000.0);
+        let market_value = table
+            .get("market")
+            .or_else(|| table.get("pair_scope"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("mayhem_only");
+        let mut market = Market::from_config_value(market_value).unwrap_or(Market::MayhemOnly);
+        if let Some(value) = catarnith::config::env_lookup("MAYHEM_MARKET")
+            .or_else(|| catarnith::config::env_lookup("MAYHEM_PAIR_SCOPE"))
+            .or_else(|| catarnith::config::env_lookup("MAYHEM_LIVE_MARKET"))
+            .or_else(|| catarnith::config::env_lookup("MAYHEM_LIVE_PAIR_SCOPE"))
+        {
+            market = Market::from_config_value(&value).unwrap_or(market);
+        }
         // Helius key: prefer the TOML, fall back to the env var.
         let helius_key = table
             .get("helius_api_key")
@@ -2690,11 +3675,15 @@ async fn run_settings(
             require_manual_live_unlock,
         );
         let mut live_max_balance_lamports = live_table
-            .and_then(|t| t.get("max_balance_lamports"))
-            .and_then(|v| v.as_integer())
-            .filter(|v| *v > 0)
-            .unwrap_or(50_000_000) as u64;
-        if let Some(value) = catarnith::config::env_lookup("MAYHEM_LIVE_MAX_BALANCE_LAMPORTS") {
+            .map(|t| toml_sol_or_lamports(t, "max_balance_sol", "max_balance_lamports", 50_000_000))
+            .unwrap_or(50_000_000);
+        if let Some(value) = catarnith::config::env_lookup("MAYHEM_LIVE_MAX_BALANCE_SOL") {
+            if let Ok(parsed) = value.parse::<f64>() {
+                live_max_balance_lamports = (parsed * 1_000_000_000.0).round() as u64;
+            }
+        } else if let Some(value) =
+            catarnith::config::env_lookup("MAYHEM_LIVE_MAX_BALANCE_LAMPORTS")
+        {
             if let Ok(parsed) = value.parse::<u64>() {
                 live_max_balance_lamports = parsed;
             }
@@ -2724,12 +3713,18 @@ async fn run_settings(
         jito_block_engine_url = catarnith::config::env_lookup("MAYHEM_LIVE_JITO_BLOCK_ENGINE_URL")
             .unwrap_or(jito_block_engine_url);
         let mut jito_tip_lamports = live_table
-            .and_then(|t| t.get("jito_tip_lamports"))
-            .and_then(|v| v.as_integer())
-            .unwrap_or(100_000)
-            .to_string();
-        jito_tip_lamports = catarnith::config::env_lookup("MAYHEM_LIVE_JITO_TIP_LAMPORTS")
-            .unwrap_or(jito_tip_lamports);
+            .map(|t| toml_sol_or_lamports(t, "jito_tip_sol", "jito_tip_lamports", 100_000))
+            .unwrap_or(100_000);
+        if let Some(value) = catarnith::config::env_lookup("MAYHEM_LIVE_JITO_TIP_SOL") {
+            if let Ok(parsed) = value.parse::<f64>() {
+                jito_tip_lamports = (parsed * 1_000_000_000.0).round() as u64;
+            }
+        } else if let Some(value) = catarnith::config::env_lookup("MAYHEM_LIVE_JITO_TIP_LAMPORTS") {
+            if let Ok(parsed) = value.parse::<u64>() {
+                jito_tip_lamports = parsed;
+            }
+        }
+        let jito_tip_sol = format_sol(jito_tip_lamports as f64 / 1_000_000_000.0);
         let mut confirmation_poll_ms = live_table
             .and_then(|t| t.get("confirmation_poll_ms"))
             .and_then(|v| v.as_integer())
@@ -2747,6 +3742,7 @@ async fn run_settings(
         );
         (
             buy_size_sol,
+            market,
             helius_key,
             slippage_bps,
             max_hold_secs,
@@ -2756,7 +3752,7 @@ async fn run_settings(
             sell_slippage_bps,
             priority_fee_microlamports,
             jito_block_engine_url,
-            jito_tip_lamports,
+            jito_tip_sol,
             confirmation_poll_ms,
             pre_broadcast_simulation,
         )
@@ -2768,6 +3764,7 @@ async fn run_settings(
         let mut s = state.write().await;
         s.settings.reset();
         s.settings.buy_size_sol = buy_size_sol;
+        s.settings.market = market;
         s.settings.helius_key = helius_key;
         s.settings.fallback_rpc = fallback_rpc;
         s.settings.jupiter_key = jupiter_key;
@@ -2780,7 +3777,7 @@ async fn run_settings(
         s.settings.sell_slippage_bps = sell_slippage_bps;
         s.settings.priority_fee_microlamports = priority_fee_microlamports;
         s.settings.jito_block_engine_url = jito_block_engine_url;
-        s.settings.jito_tip_lamports = jito_tip_lamports;
+        s.settings.jito_tip_sol = jito_tip_sol;
         s.settings.confirmation_poll_ms = confirmation_poll_ms;
         s.settings.pre_broadcast_simulation = pre_broadcast_simulation;
         if first_run {
@@ -2816,6 +3813,7 @@ async fn run_settings(
                 s.settings.error = None;
                 s.settings.saved = false;
                 match s.settings.active_field {
+                    SettingsField::Market => s.settings.market = s.settings.market.cycle(),
                     SettingsField::Theme => s.settings.theme = s.settings.theme.cycle(),
                     SettingsField::AdvancedToggle => {
                         s.settings.show_advanced = !s.settings.show_advanced;
@@ -2850,10 +3848,11 @@ async fn run_settings(
                     SettingsField::SellSlippageBps => s.settings.sell_slippage_bps.push(c),
                     SettingsField::PriorityFee => s.settings.priority_fee_microlamports.push(c),
                     SettingsField::JitoUrl => s.settings.jito_block_engine_url.push(c),
-                    SettingsField::JitoTipLamports => s.settings.jito_tip_lamports.push(c),
+                    SettingsField::JitoTipSol => s.settings.jito_tip_sol.push(c),
                     SettingsField::ConfirmationPollMs => s.settings.confirmation_poll_ms.push(c),
                     // Selector fields are changed with ←/→, not typing.
-                    SettingsField::Theme
+                    SettingsField::Market
+                    | SettingsField::Theme
                     | SettingsField::AdvancedToggle
                     | SettingsField::EnableLiveTrading
                     | SettingsField::RequireManualLiveUnlock
@@ -2898,14 +3897,15 @@ async fn run_settings(
                     SettingsField::JitoUrl => {
                         s.settings.jito_block_engine_url.pop();
                     }
-                    SettingsField::JitoTipLamports => {
-                        s.settings.jito_tip_lamports.pop();
+                    SettingsField::JitoTipSol => {
+                        s.settings.jito_tip_sol.pop();
                     }
                     SettingsField::ConfirmationPollMs => {
                         s.settings.confirmation_poll_ms.pop();
                     }
                     // Non-text fields ignore Backspace.
-                    SettingsField::Theme
+                    SettingsField::Market
+                    | SettingsField::Theme
                     | SettingsField::AdvancedToggle
                     | SettingsField::EnableLiveTrading
                     | SettingsField::RequireManualLiveUnlock
@@ -2918,6 +3918,7 @@ async fn run_settings(
                     SettingsSnapshot {
                         wallet_b58: s.settings.wallet_b58.clone(),
                         buy_size_sol: s.settings.buy_size_sol.clone(),
+                        market: s.settings.market,
                         helius_key: s.settings.helius_key.clone(),
                         fallback_rpc: s.settings.fallback_rpc.clone(),
                         jupiter_key: s.settings.jupiter_key.clone(),
@@ -2930,7 +3931,7 @@ async fn run_settings(
                         sell_slippage_bps: s.settings.sell_slippage_bps.clone(),
                         priority_fee_microlamports: s.settings.priority_fee_microlamports.clone(),
                         jito_block_engine_url: s.settings.jito_block_engine_url.clone(),
-                        jito_tip_lamports: s.settings.jito_tip_lamports.clone(),
+                        jito_tip_sol: s.settings.jito_tip_sol.clone(),
                         confirmation_poll_ms: s.settings.confirmation_poll_ms.clone(),
                         pre_broadcast_simulation: s.settings.pre_broadcast_simulation,
                     }
@@ -2967,6 +3968,7 @@ async fn run_settings(
 struct SettingsSnapshot {
     wallet_b58: String,
     buy_size_sol: String,
+    market: Market,
     helius_key: String,
     fallback_rpc: String,
     jupiter_key: String,
@@ -2979,14 +3981,24 @@ struct SettingsSnapshot {
     sell_slippage_bps: String,
     priority_fee_microlamports: String,
     jito_block_engine_url: String,
-    jito_tip_lamports: String,
+    jito_tip_sol: String,
     confirmation_poll_ms: String,
     pre_broadcast_simulation: bool,
 }
 
+fn read_config_or_default(config_path: &std::path::Path) -> Result<String> {
+    match std::fs::read_to_string(config_path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            toml::to_string(&Config::default()).context("serialize default config")
+        }
+        Err(err) => Err(err).with_context(|| format!("read config {config_path:?}")),
+    }
+}
+
 /// Persist wallet key (optional) and buy size to the active config
 /// file, then lock it down to owner-read/write. Also update the
-/// project `.env` if it contains overrides (`CTARNITH_LIVE_BASE_BUY_LAMPORTS`
+/// project `.env` if it contains overrides (`CTARNITH_LIVE_BASE_BUY_SOL`
 /// or `CTARNITH_WALLET_KEYPAIR_BASE58`, or their legacy `MAYHEM_*` aliases),
 /// because those take precedence over the TOML file at runtime. Legacy
 /// `MAYHEM_*` override lines are migrated to the canonical name on save.
@@ -3070,19 +4082,21 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
     }
 
     let jito_block_engine_url = vals.jito_block_engine_url.trim();
-    if !jito_block_engine_url.is_empty()
-        && !(jito_block_engine_url.starts_with("https://")
-            || jito_block_engine_url.starts_with("http://"))
+    if !(jito_block_engine_url.is_empty()
+        || jito_block_engine_url.starts_with("https://")
+        || jito_block_engine_url.starts_with("http://"))
     {
         bail!("jito url must start with https:// or http://");
     }
 
-    let jito_tip_lamports: u64 = vals
-        .jito_tip_lamports
+    let jito_tip_sol: f64 = vals
+        .jito_tip_sol
         .trim()
         .parse()
-        .context("jito tip is not a valid integer (lamports)")?;
-
+        .context("jito tip is not a valid SOL number")?;
+    if !jito_tip_sol.is_finite() || jito_tip_sol < 0.0 {
+        bail!("jito tip must be a non-negative SOL number");
+    }
     let confirmation_poll_ms: u64 = vals
         .confirmation_poll_ms
         .trim()
@@ -3094,16 +4108,18 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
 
     let helius_key = vals.helius_key.trim();
 
-    let content = std::fs::read_to_string(config_path)
-        .with_context(|| format!("read config {config_path:?}"))?;
+    let content = read_config_or_default(config_path)?;
     let mut table: toml::Table = content
         .parse()
         .with_context(|| format!("parse config {config_path:?}"))?;
 
+    table.remove("pair_scope");
     table.insert(
-        "base_buy_lamports".to_string(),
-        toml::Value::Integer(lamports as i64),
+        "market".to_string(),
+        toml::Value::String(vals.market.as_str().to_string()),
     );
+    table.remove("base_buy_lamports");
+    table.insert("base_buy_sol".to_string(), toml::Value::Float(sol));
     if !trimmed_wallet.is_empty() {
         table.insert(
             "wallet_keypair_base58".to_string(),
@@ -3140,9 +4156,10 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
     let live_table = live_value
         .as_table_mut()
         .context("[live] config section must be a table")?;
+    live_table.remove("max_balance_lamports");
     live_table.insert(
-        "max_balance_lamports".to_string(),
-        toml::Value::Integer(live_max_balance_lamports as i64),
+        "max_balance_sol".to_string(),
+        toml::Value::Float(live_max_balance_sol),
     );
     live_table.insert(
         "sell_slippage_bps".to_string(),
@@ -3160,10 +4177,8 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
             toml::Value::String(jito_block_engine_url.to_string()),
         );
     }
-    live_table.insert(
-        "jito_tip_lamports".to_string(),
-        toml::Value::Integer(jito_tip_lamports as i64),
-    );
+    live_table.remove("jito_tip_lamports");
+    live_table.insert("jito_tip_sol".to_string(), toml::Value::Float(jito_tip_sol));
     live_table.insert(
         "confirmation_poll_ms".to_string(),
         toml::Value::Integer(confirmation_poll_ms as i64),
@@ -3190,20 +4205,21 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
     // values the user just edited in the TOML.
     let env_note = update_env_file(
         config_path,
-        lamports,
         trimmed_wallet,
         helius_key,
         vals.fallback_rpc.trim(),
         vals.jupiter_key.trim(),
+        vals.market,
+        sol,
         slippage_bps,
         max_hold_secs,
         vals.enable_live_trading,
         vals.require_manual_live_unlock,
-        live_max_balance_lamports,
+        live_max_balance_sol,
         sell_slippage_bps,
         priority_fee_microlamports,
         jito_block_engine_url,
-        jito_tip_lamports,
+        jito_tip_sol,
         confirmation_poll_ms,
         vals.pre_broadcast_simulation,
     )
@@ -3217,7 +4233,11 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
         "live disabled"
     };
     Ok(format!(
-        "saved base_buy_lamports={lamports} slippage_bps={slippage_bps} max_hold_s={max_hold_secs} live_max_balance_lamports={live_max_balance_lamports} sell_slippage_bps={sell_slippage_bps} priority_fee={priority_fee_microlamports} jito_tip={jito_tip_lamports} confirmation_poll_ms={confirmation_poll_ms} ({live_gate}) to {config_path:?}{}",
+        "saved market={} buy_sol={} slippage_bps={slippage_bps} max_hold_s={max_hold_secs} live_max_balance_sol={} sell_slippage_bps={sell_slippage_bps} priority_fee={priority_fee_microlamports} jito_tip_sol={} confirmation_poll_ms={confirmation_poll_ms} ({live_gate}) to {config_path:?}{}",
+        vals.market.as_str(),
+        format_sol(sol),
+        format_sol(live_max_balance_sol),
+        format_sol(jito_tip_sol),
         env_note
             .map(|p| format!(" and {p:?}"))
             .unwrap_or_default(),
@@ -3226,26 +4246,28 @@ fn save_settings(config_path: &std::path::Path, vals: &SettingsSnapshot) -> Resu
 
 /// Update the project `.env` so runtime env overrides do not shadow
 /// the values written to the active TOML. Rewrites (or appends) the
-/// terminal keys: base buy lamports, wallet base58, Helius key, fallback
+/// terminal keys: base buy SOL, wallet base58, Helius key, fallback
 /// RPC, Jupiter key, max slippage bps, and max hold seconds. Empty secret
 /// values (Helius/Jupiter/wallet) are skipped so an existing key is never
 /// blanked. Returns the path of the updated `.env`, or `None` if none exists.
+#[allow(clippy::too_many_arguments)]
 fn update_env_file(
     config_path: &std::path::Path,
-    lamports: u64,
     wallet_b58: &str,
     helius_key: &str,
     fallback_rpc: &str,
     jupiter_key: &str,
+    market: Market,
+    buy_sol: f64,
     slippage_bps: u32,
     max_hold_secs: i64,
     enable_live_trading: bool,
     require_manual_live_unlock: bool,
-    live_max_balance_lamports: u64,
+    live_max_balance_sol: f64,
     sell_slippage_bps: u32,
     priority_fee_microlamports: u64,
     jito_block_engine_url: &str,
-    jito_tip_lamports: u64,
+    jito_tip_sol: f64,
     confirmation_poll_ms: u64,
     pre_broadcast_simulation: bool,
 ) -> Result<Option<String>> {
@@ -3281,7 +4303,9 @@ fn update_env_file(
     let helius_opt = (!helius_key.is_empty()).then_some(helius_key);
     let jupiter_opt = (!jupiter_key.is_empty()).then_some(jupiter_key);
     let env_values = vec![
-        ("LIVE_BASE_BUY_LAMPORTS", lamports.to_string()),
+        ("MARKET", market.as_str().to_string()),
+        ("LIVE_MARKET", market.as_str().to_string()),
+        ("LIVE_BASE_BUY_SOL", format_sol(buy_sol)),
         ("FALLBACK_RPC_URL", fallback_rpc.to_string()),
         ("LIVE_MAX_SLIPPAGE_BPS", slippage_bps.to_string()),
         ("LIVE_MAX_HOLD_SECONDS", max_hold_secs.to_string()),
@@ -3290,10 +4314,7 @@ fn update_env_file(
             "LIVE_REQUIRE_MANUAL_LIVE_UNLOCK",
             require_manual_live_unlock.to_string(),
         ),
-        (
-            "LIVE_MAX_BALANCE_LAMPORTS",
-            live_max_balance_lamports.to_string(),
-        ),
+        ("LIVE_MAX_BALANCE_SOL", format_sol(live_max_balance_sol)),
         ("LIVE_SELL_SLIPPAGE_BPS", sell_slippage_bps.to_string()),
         (
             "LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS",
@@ -3303,7 +4324,7 @@ fn update_env_file(
             "LIVE_JITO_BLOCK_ENGINE_URL",
             jito_block_engine_url.to_string(),
         ),
-        ("LIVE_JITO_TIP_LAMPORTS", jito_tip_lamports.to_string()),
+        ("LIVE_JITO_TIP_SOL", format_sol(jito_tip_sol)),
         (
             "LIVE_CONFIRMATION_POLL_MS",
             confirmation_poll_ms.to_string(),
@@ -3484,6 +4505,8 @@ enum CycleOutcome {
 
 const LIVE_ENTRY_BALANCE_RETRIES: usize = 4;
 const LIVE_ENTRY_BALANCE_RETRY_MS: u64 = 150;
+const LIVE_SELL_RECONCILE_RETRIES: usize = 10;
+const LIVE_SELL_RECONCILE_RETRY_MS: u64 = 250;
 
 fn report_token_amount(report: &ExecutionReport) -> u128 {
     report.filled_token_amount_raw.unwrap_or_default()
@@ -3508,6 +4531,27 @@ async fn live_wallet_amount_after_entry(
         }
     }
     Ok(None)
+}
+
+async fn live_wallet_amount_after_sell(executor: &ScanExecutor, mint: &str) -> Result<u128> {
+    let mut last_amount = None;
+    for attempt in 1..=LIVE_SELL_RECONCILE_RETRIES {
+        match executor.fetch_token_balance(mint).await {
+            Ok(0) => return Ok(0),
+            Ok(amount) => {
+                last_amount = Some(amount);
+                if attempt < LIVE_SELL_RECONCILE_RETRIES {
+                    tokio::time::sleep(Duration::from_millis(LIVE_SELL_RECONCILE_RETRY_MS)).await;
+                }
+            }
+            Err(err) if attempt < LIVE_SELL_RECONCILE_RETRIES => {
+                tracing::debug!("sell balance fetch attempt {attempt} failed for {mint}: {err:#}");
+                tokio::time::sleep(Duration::from_millis(LIVE_SELL_RECONCILE_RETRY_MS)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(last_amount.unwrap_or(0))
 }
 
 async fn filled_entry_amount(
@@ -3555,12 +4599,15 @@ async fn accept_fresh_create_event_slot(
     event_tx: &mpsc::UnboundedSender<ScanEvent>,
     rpc: &RpcClient,
     slot_cache: &mut CreateSlotCache,
+    stale_create_log: &mut StaleCreateUiLog,
 ) -> bool {
     if event.slot == 0 {
-        let _ = event_tx.send(ScanEvent::Log(format!(
-            "skip stale create {} - missing event slot",
-            event.signature
-        )));
+        stale_create_log.emit(
+            event_tx,
+            "missing event slot",
+            None,
+            cfg.max_create_event_slot_lag,
+        );
         return false;
     }
 
@@ -3574,10 +4621,8 @@ async fn accept_fresh_create_event_slot(
                 slot
             }
             Err(err) => {
-                let _ = event_tx.send(ScanEvent::Log(format!(
-                    "skip stale create {} - current slot check failed: {err:#}",
-                    event.signature
-                )));
+                let reason = format!("current slot check failed: {err:#}");
+                stale_create_log.emit(event_tx, &reason, None, cfg.max_create_event_slot_lag);
                 return false;
             }
         }
@@ -3589,10 +4634,12 @@ async fn accept_fresh_create_event_slot(
 
     let slot_lag = current_slot.saturating_sub(event.slot);
     if slot_lag > cfg.max_create_event_slot_lag {
-        let _ = event_tx.send(ScanEvent::Log(format!(
-            "skip stale create {} - slot lag {} > {}",
-            event.signature, slot_lag, cfg.max_create_event_slot_lag
-        )));
+        stale_create_log.emit(
+            event_tx,
+            "slot lag exceeded",
+            Some(slot_lag),
+            cfg.max_create_event_slot_lag,
+        );
         return false;
     }
 
@@ -3617,10 +4664,38 @@ impl CreateSlotCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct StaleCreateUiLog {
+    rejected: u64,
+}
+
+impl StaleCreateUiLog {
+    fn emit(
+        &mut self,
+        event_tx: &mpsc::UnboundedSender<ScanEvent>,
+        reason: &str,
+        slot_lag: Option<u64>,
+        max_slot_lag: u64,
+    ) {
+        self.rejected = self.rejected.saturating_add(1);
+        if self.rejected != 1 && !self.rejected.is_multiple_of(25) {
+            return;
+        }
+        let lag = slot_lag
+            .map(|lag| lag.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let _ = event_tx.send(ScanEvent::Log(format!(
+            "skipping stale creates count={} latest_reason={} latest_slot_lag={} max_slot_lag={}",
+            self.rejected, reason, lag, max_slot_lag
+        )));
+    }
+}
+
 /// Runs one full cycle: scan WS logs for a fresh Pump.fun mint, enter
 /// when found, hold while mcap ticks, fire sell on operator input
 /// (Enter), then close the trade.
 #[allow(unused_assignments)]
+#[allow(clippy::arc_with_non_send_sync)]
 async fn run_lifecycle(
     cfg: &Config,
     market: &Arc<MarketData>,
@@ -3659,6 +4734,7 @@ async fn run_lifecycle(
         CommitmentConfig::processed(),
     );
     let mut create_slot_cache = CreateSlotCache::default();
+    let mut stale_create_log = StaleCreateUiLog::default();
 
     let mut entered_mint: Option<String> = None;
     let mut _curve_poll: Option<CurvePollGuard> = None;
@@ -3705,11 +4781,15 @@ async fn run_lifecycle(
                             (s.mint.clone(), held_ms.max(0))
                         };
                         entered_mint = None;
-                        return close_trade(
+                        let sold = close_trade(
                             cfg, executor, state, event_tx, journal, &mint, held_ms, cmd_rx,
                         )
-                        .await
-                        .map(|()| CycleOutcome::Closed);
+                        .await?;
+                        if sold {
+                            return Ok(CycleOutcome::Closed);
+                        }
+                        entered_mint = Some(mint);
+                        continue;
                     } else {
                         let _ = event_tx.send(ScanEvent::Log(
                             "start ignored - not in a held position".into(),
@@ -3717,6 +4797,9 @@ async fn run_lifecycle(
                     }
                 }
                 Some(ScanCommand::Cancel) => {
+                    if close_log_overlay_if_open(state, event_tx).await {
+                        continue;
+                    }
                     // Esc returns to the mode picker. While holding a
                     // position, the first Esc only arms a confirmation
                     // (we don't want a stray keypress to abandon an open
@@ -3767,6 +4850,9 @@ async fn run_lifecycle(
                 Some(ScanCommand::ShowLogs) => {
                     let _ = event_tx.send(ScanEvent::ToggleLogs);
                 }
+                Some(ScanCommand::ScrollLogs(delta)) => {
+                    let _ = event_tx.send(ScanEvent::ScrollLogs(delta));
+                }
                 _ => {}
             }
         }
@@ -3799,6 +4885,7 @@ async fn run_lifecycle(
                 event_tx,
                 &slot_rpc,
                 &mut create_slot_cache,
+                &mut stale_create_log,
             )
             .await
         {
@@ -3810,46 +4897,18 @@ async fn run_lifecycle(
             // We already entered; ignore new creates. Still listen
             // for trade events to update mcap.
         } else {
-            // Phase: Evaluating. In Mayhem-only scope, confirm the
-            // curve before paying for a buy. In all-Pump.fun scope,
-            // the create event itself is enough and we skip the RPC
-            // round-trip for speed.
+            // Phase: Evaluating. Market-specific modes must confirm
+            // the curve flag before paying for a buy. In all-Pump.fun
+            // scope, the create event itself is enough and we skip the
+            // RPC round-trip for speed.
             let sym = mint.chars().take(8).collect::<String>();
-            let in_scope = match cfg.pair_scope {
-                PairScope::AllPumpfun => true,
-                PairScope::MayhemOnly => {
-                    let trust_ws_mayhem =
-                        catarnith::config::env_lookup("MAYHEM_SCAN_TRUST_WS_MAYHEM")
-                            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
-                    if trust_ws_mayhem {
-                        // Fast path: trust the WS log stream. We only reach this
-                        // branch if `extract_pump_create_event_mint` found a Pump
-                        // create event. If the same log set also mentions the
-                        // Mayhem program, treat it as Mayhem and skip the RPC round-trip.
-                        logs_have_mayhem_program(&stream_event.logs, &cfg.mayhem_program)
-                    } else {
-                        let client = catarnith::curve::CurveQuoteClient::new(
-                            cfg.rpc_url(),
-                            &cfg.pumpfun_program,
-                        )
-                        .context("construct curve client for mayhem check")
-                        .ok();
-                        match client {
-                            Some(c) => c
-                                .fetch_state(&mint)
-                                .await
-                                .ok()
-                                .and_then(|s| s.is_mayhem_mode)
-                                .unwrap_or(false),
-                            None => false,
-                        }
-                    }
-                }
-            };
-            if !in_scope {
+            let scope = check_create_market_scope(cfg, &mint, &stream_event.logs).await;
+            if !matches!(scope, CreateMarketScope::InScope) {
                 let mut s = state.write().await;
                 s.scanned += 1;
+                if let CreateMarketScope::Unknown(reason) = scope {
+                    s.last_error = Some(format!("skip {sym}: market check unknown ({reason})"));
+                }
                 continue;
             }
             {
@@ -4030,6 +5089,7 @@ async fn run_lifecycle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn close_trade(
     cfg: &Config,
     executor: &ScanExecutor,
@@ -4039,7 +5099,7 @@ async fn close_trade(
     mint: &str,
     held_ms: i64,
     cmd_rx: &mut mpsc::UnboundedReceiver<ScanCommand>,
-) -> Result<()> {
+) -> Result<bool> {
     // Resolve the actual amount to sell. Prefer a fresh wallet
     // balance read so we dump *all* tokens (including any dust
     // from rounding). If the RPC snapshot is stale/closed, fall
@@ -4067,7 +5127,7 @@ async fn close_trade(
             let _ = event_tx.send(ScanEvent::Log(
                 "close_trade: balance and cached amount are 0 - nothing to sell".into(),
             ));
-            return Ok(());
+            return Ok(true);
         }
         amount
     };
@@ -4126,8 +5186,17 @@ async fn close_trade(
                     let _ = event_tx.send(ScanEvent::Log("trying jupiter fallback…".into()));
                     match executor.jupiter_sell_fallback(mint, amount).await {
                         Ok(r) => {
-                            let _ = event_tx
-                                .send(ScanEvent::Log("jupiter fallback sold the position".into()));
+                            let message = match r.status {
+                                ExecutionStatus::LiveConfirmed
+                                | ExecutionStatus::LiveReconciled => {
+                                    "jupiter fallback closed the position"
+                                }
+                                ExecutionStatus::LiveSubmitted => {
+                                    "jupiter fallback submitted sell; waiting for confirmation"
+                                }
+                                _ => "jupiter fallback returned without confirmed close",
+                            };
+                            let _ = event_tx.send(ScanEvent::Log(message.into()));
                             report = Some(r);
                         }
                         Err(jerr) => {
@@ -4143,15 +5212,127 @@ async fn close_trade(
         }
         match report {
             Some(r) => r,
-            None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("sell failed"))),
+            None => {
+                let detail = last_err
+                    .as_ref()
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "sell failed".to_string());
+                restore_holding_after_sell_issue(
+                    state,
+                    event_tx,
+                    &detail,
+                    "sell failed - still holding; press Enter to retry",
+                )
+                .await;
+                return Ok(false);
+            }
         }
     };
     let _ = journal.record(JournalKind::Execution, &report);
     if executor.is_paper() {
         let _ = append_paper_report(&cfg.paper_report_path, &report);
     }
+    let mut report = report;
+    if matches!(
+        report.status,
+        ExecutionStatus::LiveSubmitted | ExecutionStatus::LiveFailed | ExecutionStatus::Errored
+    ) {
+        match live_wallet_amount_after_sell(executor, mint).await {
+            Ok(0) => {
+                let old_status = report.status;
+                report.status = ExecutionStatus::LiveReconciled;
+                if report.filled_lamports.unwrap_or_default() == 0 {
+                    let entry_lamports = state.read().await.entry_lamports;
+                    if entry_lamports > 0 {
+                        report.filled_lamports = Some(entry_lamports);
+                        report.error = Some(
+                            "sell_reconciled_balance_zero; proceeds estimated from entry"
+                                .to_string(),
+                        );
+                    }
+                }
+                let _ = event_tx.send(ScanEvent::Log(format!(
+                    "sell reconciled on-chain after {old_status:?}; wallet token balance is zero"
+                )));
+            }
+            Ok(amount) if report.status == ExecutionStatus::LiveSubmitted => {
+                let sig = report.signature.clone().unwrap_or_default();
+                let short_sig = short_id(&sig);
+                let _ = event_tx.send(ScanEvent::Log(format!(
+                    "sell submitted but not confirmed sig={short_sig}; wallet still shows token balance"
+                )));
+                let _ = event_tx.send(ScanEvent::PanicSubmitted {
+                    signature: sig,
+                    status: report.status,
+                });
+                restore_holding_after_sell_issue(
+                    state,
+                    event_tx,
+                    &format!("sell confirmation pending; wallet token balance still {amount}"),
+                    "sell pending - wallet still shows tokens; press Enter to retry",
+                )
+                .await;
+                return Ok(false);
+            }
+            Ok(amount) => {
+                let detail = report.error.as_deref().unwrap_or("sell failed").to_string();
+                let sig = report.signature.clone().unwrap_or_default();
+                let _ = event_tx.send(ScanEvent::PanicSubmitted {
+                    signature: sig,
+                    status: report.status,
+                });
+                restore_holding_after_sell_issue(
+                    state,
+                    event_tx,
+                    &format!("{detail}; wallet token balance still {amount}"),
+                    "sell failed - wallet still shows tokens; press Enter to retry",
+                )
+                .await;
+                return Ok(false);
+            }
+            Err(err) if report.status == ExecutionStatus::LiveSubmitted => {
+                let sig = report.signature.clone().unwrap_or_default();
+                let short_sig = short_id(&sig);
+                let _ = event_tx.send(ScanEvent::Log(format!(
+                    "sell submitted but balance check failed sig={short_sig}; check chain before retry"
+                )));
+                let _ = event_tx.send(ScanEvent::PanicSubmitted {
+                    signature: sig,
+                    status: report.status,
+                });
+                restore_holding_after_sell_issue(
+                    state,
+                    event_tx,
+                    &format!("sell confirmation pending; balance check failed: {err:#}"),
+                    "sell status unknown - verify signature before retry",
+                )
+                .await;
+                return Ok(false);
+            }
+            Err(err) => {
+                let detail = report.error.as_deref().unwrap_or("sell failed").to_string();
+                let sig = report.signature.clone().unwrap_or_default();
+                let _ = event_tx.send(ScanEvent::PanicSubmitted {
+                    signature: sig,
+                    status: report.status,
+                });
+                restore_holding_after_sell_issue(
+                    state,
+                    event_tx,
+                    &format!("{detail}; balance check failed: {err:#}"),
+                    "sell failed - balance check failed; press Enter to retry",
+                )
+                .await;
+                return Ok(false);
+            }
+        }
+    }
     let sig = report.signature.clone().unwrap_or_default();
     let status = report.status;
+    let proceeds_estimated = report
+        .error
+        .as_deref()
+        .is_some_and(|err| err.contains("proceeds estimated from entry"));
     let exit_sol = report.filled_lamports.unwrap_or(0) as f64 / 1_000_000_000.0;
     let (entry_sol, entry_usd, exit_usd, realized_usd) = {
         let s = state.read().await;
@@ -4177,29 +5358,129 @@ async fn close_trade(
             held_ms,
             won,
         });
-        if won {
+        if proceeds_estimated {
+            // Inventory is gone, but proceeds were not observable. Do not
+            // count this as a win or loss.
+        } else if won {
             s.trades_won += 1;
         } else {
             s.trades_lost += 1;
         }
-        let _ = event_tx.send(ScanEvent::Log(format!(
-            "SOLD {} | exit ${:.2} | pnl ${:+.2} ({:.4} SOL)",
-            mint.chars().take(8).collect::<String>(),
-            exit_usd,
-            realized_usd,
-            realized_sol
-        )));
+        let verb = if status == ExecutionStatus::LiveReconciled {
+            "CLOSED"
+        } else {
+            "SOLD"
+        };
+        let short_mint = mint.chars().take(8).collect::<String>();
+        let line = if proceeds_estimated {
+            format!("{verb} {short_mint} | inventory zero | proceeds estimated; verify explorer")
+        } else {
+            format!(
+                "{verb} {short_mint} | exit ${exit_usd:.2} | pnl ${realized_usd:+.2} ({realized_sol:.4} SOL)"
+            )
+        };
+        let _ = event_tx.send(ScanEvent::Log(line));
         let _ = event_tx.send(ScanEvent::PanicSubmitted {
             signature: sig,
             status,
         });
     }
-    Ok(())
+    Ok(true)
+}
+
+async fn restore_holding_after_sell_issue(
+    state: &Arc<RwLock<ScanState>>,
+    event_tx: &mpsc::UnboundedSender<ScanEvent>,
+    detail: &str,
+    message: &str,
+) {
+    {
+        let mut s = state.write().await;
+        s.phase = Phase::Holding;
+        s.confirm_exit = false;
+        s.last_error = Some(format!("sell failed; still holding: {detail}"));
+    }
+    let _ = event_tx.send(ScanEvent::Log(message.to_string()));
+    let _ = event_tx.send(ScanEvent::StateChanged);
+}
+
+fn short_id(value: &str) -> String {
+    if value.is_empty() {
+        "none".to_string()
+    } else {
+        value.chars().take(12).collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateMarketScope {
+    InScope,
+    OutOfScope(&'static str),
+    Unknown(&'static str),
+}
+
+async fn check_create_market_scope(cfg: &Config, mint: &str, logs: &[String]) -> CreateMarketScope {
+    if cfg.market == Market::AllPumpfun {
+        return CreateMarketScope::InScope;
+    }
+
+    let logs_mayhem = logs_have_mayhem_program(logs, &cfg.mayhem_program);
+    let trust_ws_mayhem = catarnith::config::env_lookup("MAYHEM_SCAN_TRUST_WS_MAYHEM")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if cfg.market == Market::MayhemOnly && trust_ws_mayhem && logs_mayhem {
+        return CreateMarketScope::InScope;
+    }
+    if cfg.market == Market::NonMayhemOnly && logs_mayhem {
+        return CreateMarketScope::OutOfScope("mayhem_program_in_create_logs");
+    }
+
+    let curve_flag = fetch_create_mayhem_flag(cfg, mint).await;
+    decide_create_market_scope(cfg.market, curve_flag)
+}
+
+async fn fetch_create_mayhem_flag(cfg: &Config, mint: &str) -> Option<bool> {
+    let client =
+        catarnith::curve::CurveQuoteClient::new(cfg.rpc_url(), &cfg.pumpfun_program).ok()?;
+    for delay_ms in [0_u64, 80, 160] {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        if let Ok(state) = client.fetch_state(mint).await {
+            if let Some(is_mayhem) = state.is_mayhem_mode {
+                return Some(is_mayhem);
+            }
+        }
+    }
+    None
+}
+
+fn decide_create_market_scope(
+    market: Market,
+    curve_mayhem_flag: Option<bool>,
+) -> CreateMarketScope {
+    match market {
+        Market::AllPumpfun => CreateMarketScope::InScope,
+        Market::MayhemOnly => match curve_mayhem_flag {
+            Some(true) => CreateMarketScope::InScope,
+            Some(false) => CreateMarketScope::OutOfScope("curve_is_not_mayhem"),
+            None => CreateMarketScope::Unknown("curve_mayhem_flag_unavailable"),
+        },
+        Market::NonMayhemOnly => match curve_mayhem_flag {
+            Some(false) => CreateMarketScope::InScope,
+            Some(true) => CreateMarketScope::OutOfScope("curve_is_mayhem"),
+            None => CreateMarketScope::Unknown("curve_mayhem_flag_unavailable"),
+        },
+    }
 }
 
 /// True if any log line contains the Mayhem program pubkey.
 /// Used by the fast WS-trust path to skip the pre-buy RPC check.
 fn logs_have_mayhem_program(logs: &[String], mayhem_program: &str) -> bool {
+    if mayhem_program.trim().is_empty() {
+        return false;
+    }
     logs.iter().any(|line| line.contains(mayhem_program))
 }
 
@@ -4235,6 +5516,7 @@ impl Drop for CurvePollGuard {
 ///   - a websocket `accountSubscribe` push (low latency, but flaky on
 ///     some RPC plans), and
 ///   - a 500ms RPC poll fallback that always works.
+///
 /// Whichever observes a newer curve state emits first; the render side
 /// keeps the latest. If the websocket plan is unreliable the poll still
 /// covers, so enabling push is strictly an upgrade.
@@ -4413,22 +5695,27 @@ impl BotLaunch {
 }
 
 /// Locate the `bot` launcher for the in-TUI bot mode. Prefers a
-/// sibling/target binary, then `cargo run` from the current source
-/// checkout, and only then `~/.cargo/bin/bot`. This avoids pairing a
-/// source-built `catarnith` with a stale installed `bot`.
+/// target binary from the config checkout, then `cargo run` from the
+/// current source checkout, and only then an installed sibling. This
+/// avoids pairing a freshly installed/source-built `catarnith` with a
+/// stale `~/.cargo/bin/bot`.
 fn find_bot_launch(bot_dir: &std::path::Path) -> Option<BotLaunch> {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("bot"));
-        }
-    }
-    candidates.push(bot_dir.join("target/release/bot"));
-    candidates.push(bot_dir.join("target/debug/bot"));
+    let candidates = vec![
+        bot_dir.join("target/release/bot"),
+        bot_dir.join("target/debug/bot"),
+    ];
     for c in candidates {
         if c.is_file() {
             return Some(BotLaunch::Binary(c));
         }
+    }
+
+    let manifest_path = bot_dir.join("Cargo.toml");
+    if manifest_path.is_file() {
+        return Some(BotLaunch::CargoRun {
+            cargo: std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
+            manifest_path,
+        });
     }
 
     let manifest_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
@@ -4437,6 +5724,15 @@ fn find_bot_launch(bot_dir: &std::path::Path) -> Option<BotLaunch> {
             cargo: std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
             manifest_path,
         });
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join("bot");
+            if sibling.is_file() {
+                return Some(BotLaunch::Binary(sibling));
+            }
+        }
     }
 
     if let Ok(home) = std::env::var("HOME") {
@@ -4495,7 +5791,7 @@ mod panic_recovery_tests {
 
     #[test]
     fn resolve_config_path_passes_through_existing_paths() {
-        // A path that exists is returned as-is (absolute).
+        // A path that exists is shown as a canonical absolute path.
         let existing = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         assert!(
             existing.exists(),
@@ -4503,16 +5799,16 @@ mod panic_recovery_tests {
             existing.display()
         );
         let resolved = super::resolve_config_path(existing.clone());
-        assert_eq!(resolved, existing);
+        assert_eq!(resolved, std::fs::canonicalize(existing).unwrap());
     }
 
     #[test]
-    fn resolve_config_path_prefers_existing_relative_path() {
+    fn resolve_config_path_canonicalizes_existing_relative_path() {
         let p = std::path::PathBuf::from("Cargo.toml");
         assert!(p.exists(), "test precondition: {}", p.display());
         let resolved =
             super::resolve_config_path_from(p.clone(), Some(std::env::temp_dir().as_path()));
-        assert_eq!(resolved, p);
+        assert_eq!(resolved, std::fs::canonicalize(p).unwrap());
     }
 
     #[test]
@@ -4563,11 +5859,13 @@ mod panic_recovery_tests {
 
     #[tokio::test]
     async fn picker_live_forces_live_validation_for_explicit_config() {
-        let mut cfg = super::Config::default();
-        cfg.mode = super::Mode::Paper;
-        cfg.helius_api_key = "test-key".to_string();
-        cfg.enable_live_trading = false;
-        cfg.require_manual_live_unlock = false;
+        let cfg = super::Config {
+            mode: super::Mode::Paper,
+            helius_api_key: "test-key".to_string(),
+            enable_live_trading: false,
+            require_manual_live_unlock: false,
+            ..super::Config::default()
+        };
 
         let err = super::resolve_trade_config(&cfg, super::Mode::Live, true)
             .await
@@ -4656,7 +5954,7 @@ mod panic_recovery_tests {
         let raw = "\x1b[2m2026-06-17T10:39:40.768759Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[2mbot\x1b[0m\x1b[2m:\x1b[0m starting mayhem bot config=...";
         assert_eq!(
             super::clean_bot_log_line(raw),
-            Some("starting mayhem bot".to_string())
+            Some("bot started".to_string())
         );
 
         let raw2 = "2026-06-17T10:39:41.622552Z  INFO catarnith::ingest: confirmed logsSubscribe subscription=4445350";
@@ -4704,5 +6002,85 @@ mod panic_recovery_tests {
         assert!(!super::is_bot_execution_log(
             "registered Mayhem discovery mint=xxx"
         ));
+    }
+
+    #[test]
+    fn create_market_scope_requires_explicit_curve_flag_for_market_modes() {
+        assert!(matches!(
+            super::decide_create_market_scope(super::Market::AllPumpfun, None),
+            super::CreateMarketScope::InScope
+        ));
+        assert!(matches!(
+            super::decide_create_market_scope(super::Market::NonMayhemOnly, Some(false)),
+            super::CreateMarketScope::InScope
+        ));
+        assert!(matches!(
+            super::decide_create_market_scope(super::Market::NonMayhemOnly, Some(true)),
+            super::CreateMarketScope::OutOfScope("curve_is_mayhem")
+        ));
+        assert!(matches!(
+            super::decide_create_market_scope(super::Market::NonMayhemOnly, None),
+            super::CreateMarketScope::Unknown("curve_mayhem_flag_unavailable")
+        ));
+        assert!(matches!(
+            super::decide_create_market_scope(super::Market::MayhemOnly, Some(true)),
+            super::CreateMarketScope::InScope
+        ));
+        assert!(matches!(
+            super::decide_create_market_scope(super::Market::MayhemOnly, Some(false)),
+            super::CreateMarketScope::OutOfScope("curve_is_not_mayhem")
+        ));
+    }
+
+    #[test]
+    fn logs_have_mayhem_program_does_not_match_empty_program() {
+        let logs = vec!["Program log: create".to_string()];
+        assert!(!super::logs_have_mayhem_program(&logs, ""));
+    }
+
+    #[test]
+    fn bot_fatal_lines_are_kept_for_restart_diagnostics() {
+        assert!(super::is_bot_fatal_log(
+            "Error: copy_trade_enabled requires fetch_full_transaction=true"
+        ));
+        assert!(super::is_bot_fatal_log(
+            "Caused by: copy_trade_wallet is not a valid Solana pubkey"
+        ));
+        assert!(super::is_bot_fatal_log(
+            "thread 'main' panicked at src/bin/bot.rs:123:4"
+        ));
+        assert!(!super::is_bot_fatal_log("heartbeat up=1s open=0"));
+    }
+
+    #[test]
+    fn bot_child_tail_keeps_recent_lines_only() {
+        let mut tail = std::collections::VecDeque::new();
+        for i in 0..(super::BOT_CHILD_TAIL + 3) {
+            super::remember_bot_child_line(&mut tail, &format!("line {i}"));
+        }
+        assert_eq!(tail.len(), super::BOT_CHILD_TAIL);
+        assert_eq!(tail.front().map(String::as_str), Some("line 3"));
+        let expected = format!("line {}", super::BOT_CHILD_TAIL + 2);
+        assert_eq!(tail.back().map(String::as_str), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn find_bot_launch_prefers_checkout_target_binary() {
+        let root = std::env::temp_dir().join(format!(
+            "catarnith_bot_launch_test_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let target = root.join("target/debug");
+        std::fs::create_dir_all(&target).unwrap();
+        let bot = target.join("bot");
+        std::fs::write(&bot, b"").unwrap();
+
+        let launch = super::find_bot_launch(&root).expect("target/debug/bot should be used");
+        match launch {
+            super::BotLaunch::Binary(path) => assert_eq!(path, bot),
+            super::BotLaunch::CargoRun { .. } => panic!("expected target/debug/bot binary"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

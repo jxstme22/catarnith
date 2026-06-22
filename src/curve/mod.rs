@@ -194,9 +194,6 @@ pub fn buy_quote_from_state(state: &BondingCurveState, sol_lamports: u128) -> Re
 }
 
 fn validate_tradeable_state(state: &BondingCurveState) -> Result<()> {
-    if state.is_mayhem_mode == Some(false) {
-        anyhow::bail!("bonding curve explicitly reports non-Mayhem mode");
-    }
     if state.complete {
         anyhow::bail!("bonding curve is complete; use PumpSwap market quote");
     }
@@ -305,9 +302,9 @@ mod tests {
     }
 
     #[test]
-    fn non_mayhem_state_still_allows_liquidation_quote() {
+    fn non_mayhem_state_still_allows_bonding_curve_quotes() {
         assert!(sell_quote_from_state(&state(Some(false)), 1_000).is_ok());
-        assert!(buy_quote_from_state(&state(Some(false)), 1_000).is_err());
+        assert!(buy_quote_from_state(&state(Some(false)), 1_000).is_ok());
     }
 
     #[test]

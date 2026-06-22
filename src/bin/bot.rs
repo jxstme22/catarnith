@@ -3,7 +3,7 @@ use catarnith::survival::read_pulse_mints;
 use catarnith::{
     analytics::EntryFeatures,
     classifier::{candidate_source, classify_token, ClassifierConfig},
-    config::Config,
+    config::{Config, CopyTradeBuyPolicy, CopyTradeSizing, Market},
     curve::{
         buy_quote_from_state, curve_state_key, sell_quote_from_state, BondingCurveState,
         CurveQuoteClient,
@@ -20,14 +20,17 @@ use catarnith::{
     live::LivePumpExecutor,
     market::{MarketQuote, MarketTracker},
     mayhem::{apply_mayhem_evidence, MayhemEvidence, MayhemEvidenceClient, MayhemEvidenceConfig},
-    position::PositionManager,
+    position::{Position, PositionManager},
     pulse::spawn_pulse_tail,
     quote_policy::{causal_curve_exit_quote, causal_trade_exit_quote, validate_entry_curve_slot},
     reporting::refresh_reports,
     risk::{RiskEngine, RiskLimits, RiskSnapshot},
     strategy::{BurstStrategy, StrategyContext, StrategySettings},
     tx_fetcher::TxFetcher,
-    types::{now_ms, Action, Decision, ExecutionReport, ExecutionStatus, Mode, SellOrder},
+    types::{
+        now_ms, Action, Decision, DecodedTx, ExecutionReport, ExecutionStatus, Mode, SellOrder,
+        TokenClassification,
+    },
 };
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use serde::Serialize;
@@ -48,6 +51,8 @@ const EXIT_CURVE_FETCH_MIN_INTERVAL_MS: i64 = 1_000;
 const EXIT_CURVE_FETCH_RATE_LIMIT_BACKOFF_MS: i64 = 5_000;
 const EXIT_CURVE_FETCH_MAX_BACKOFF_MS: i64 = 20_000;
 const CREATE_SLOT_CACHE_TTL_MS: i64 = 250;
+const STALE_STREAM_LOG_EVERY: u64 = 100;
+const STALE_CREATE_LOG_EVERY: u64 = 25;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -166,7 +171,10 @@ async fn main() -> Result<()> {
         token_2022_program: cfg.token_2022_program.clone(),
         axiom_route_program: cfg.axiom_route_program.clone(),
         axiom_jito_marker: cfg.axiom_jito_marker.clone(),
-        reference_wallet: cfg.target_wallet.clone(),
+        reference_wallet: cfg
+            .copy_trade_wallet()
+            .map(str::to_string)
+            .or_else(|| cfg.target_wallet.clone()),
     };
     let strategy_settings = StrategySettings::from(&cfg);
     let mayhem_evidence_client = MayhemEvidenceClient::new(MayhemEvidenceConfig::from(&cfg))?;
@@ -190,8 +198,9 @@ async fn main() -> Result<()> {
     let mut live_events = 0u64;
     let mut backfill_events = 0u64;
     let mut stale_stream_events = 0u64;
+    let mut stale_log_limiter = StaleLogLimiter::default();
     let mut last_live_event_ms = None::<i64>;
-    let wallet_for_delta = cfg
+    let default_wallet_for_delta = cfg
         .target_wallet
         .as_deref()
         .or_else(|| cfg.watched_wallets.first().map(String::as_str))
@@ -321,7 +330,7 @@ async fn main() -> Result<()> {
                     &tx_fetcher,
                     &mut create_slot_cache,
                     &curve_quote_client,
-                    wallet_for_delta,
+                    default_wallet_for_delta,
                     &classifier_cfg,
                     &mayhem_evidence_client,
                     &strategy_settings,
@@ -341,6 +350,7 @@ async fn main() -> Result<()> {
                     &mut curve_watches,
                     &mut curve_states,
                     &mut stale_stream_events,
+                    &mut stale_log_limiter,
                 ).await?;
             }
         }
@@ -469,6 +479,54 @@ impl SlotCache {
     }
 }
 
+#[derive(Debug, Default)]
+struct StaleLogLimiter {
+    stream_rejections: u64,
+    create_rejections: u64,
+}
+
+impl StaleLogLimiter {
+    fn stream_message(&mut self, stage: &str, age_ms: i64, max_age_ms: i64) -> Option<String> {
+        self.stream_rejections = self.stream_rejections.saturating_add(1);
+        if self.stream_rejections == 1
+            || self
+                .stream_rejections
+                .is_multiple_of(STALE_STREAM_LOG_EVERY)
+        {
+            Some(format!(
+                "stale stream events rejected count={} latest_stage={} latest_age_ms={} max_age_ms={}",
+                self.stream_rejections, stage, age_ms, max_age_ms
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn create_message(
+        &mut self,
+        reason: &str,
+        slot_lag: Option<u64>,
+        max_slot_lag: u64,
+    ) -> Option<String> {
+        self.create_rejections = self.create_rejections.saturating_add(1);
+        if self.create_rejections == 1
+            || self
+                .create_rejections
+                .is_multiple_of(STALE_CREATE_LOG_EVERY)
+        {
+            let lag = slot_lag
+                .map(|lag| lag.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            Some(format!(
+                "stale create events rejected count={} latest_reason={} latest_slot_lag={} max_slot_lag={}",
+                self.create_rejections, reason, lag, max_slot_lag
+            ))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug)]
 struct LiveExecutionCompletion {
     order_id: String,
@@ -485,7 +543,7 @@ async fn process_stream_event(
     tx_fetcher: &TxFetcher,
     create_slot_cache: &mut SlotCache,
     curve_quote_client: &CurveQuoteClient,
-    wallet_for_delta: Option<&str>,
+    default_wallet_for_delta: Option<&str>,
     classifier_cfg: &ClassifierConfig,
     mayhem_evidence_client: &MayhemEvidenceClient,
     strategy_settings: &StrategySettings,
@@ -505,6 +563,7 @@ async fn process_stream_event(
     curve_watches: &mut HashMap<String, CurveWatch>,
     curve_states: &mut HashMap<String, BondingCurveState>,
     stale_stream_events: &mut u64,
+    stale_log_limiter: &mut StaleLogLimiter,
 ) -> Result<()> {
     let is_backfill = event.source.starts_with("backfill:");
     if seen.contains(&event.signature) {
@@ -533,6 +592,7 @@ async fn process_stream_event(
             cfg.max_stream_event_age_ms,
             "queued_before_decode",
             stale_stream_events,
+            stale_log_limiter,
         )?
     {
         return Ok(());
@@ -542,8 +602,15 @@ async fn process_stream_event(
         create_event_mint.is_some() || logs_have_pump_create_signal(&event.logs);
     if cfg.mode == Mode::Live
         && has_create_signal
-        && !accept_fresh_create_event_slot(journal, tx_fetcher, create_slot_cache, &event, cfg)
-            .await?
+        && !accept_fresh_create_event_slot(
+            journal,
+            tx_fetcher,
+            create_slot_cache,
+            &event,
+            cfg,
+            stale_log_limiter,
+        )
+        .await?
     {
         return Ok(());
     }
@@ -559,13 +626,15 @@ async fn process_stream_event(
         .pointer("/params/result")
         .filter(|value| value.get("transaction").is_some())
         .cloned();
+    let copy_trade_log_source = is_copy_trade_stream_source(cfg, &event);
+    let wallet_for_delta = wallet_for_delta_for_event(cfg, &event, default_wallet_for_delta);
     let logs_have_pump_event = event.source.starts_with("logsSubscribe:")
         && (extract_pump_trade_observation(&event.logs).is_some() || has_create_signal);
     let tx = if is_backfill {
         Some(event.raw.clone())
     } else if inline_tx.is_some() {
         inline_tx
-    } else if logs_have_pump_event {
+    } else if logs_have_pump_event && !copy_trade_log_source {
         None
     } else if cfg.fetch_full_transaction {
         match fetch_transaction_with_retry(tx_fetcher, &event.signature).await {
@@ -587,6 +656,7 @@ async fn process_stream_event(
             cfg.max_stream_event_age_ms,
             "stale_after_transaction_fetch",
             stale_stream_events,
+            stale_log_limiter,
         )?
     {
         return Ok(());
@@ -837,7 +907,8 @@ async fn process_stream_event(
         observed_buys_for_mint: market_stats.observed_buys,
         observed_sells_for_mint: market_stats.observed_sells,
     };
-    let decision = strategy.decide(strategy_settings, &decoded, &classification, context);
+    let decision = copy_trade_decision(cfg, &event, &decoded, &classification, context)
+        .unwrap_or_else(|| strategy.decide(strategy_settings, &decoded, &classification, context));
     let mut snapshot = positions.snapshot_for_mint(mint);
     apply_pending_live_risk(&mut snapshot, mint, pending_live_orders);
     let decision = risk.apply(decision, &snapshot);
@@ -845,6 +916,19 @@ async fn process_stream_event(
         journal.record(JournalKind::RiskVeto, &decision)?;
     }
     journal.record(JournalKind::Decision, &decision)?;
+    if decision
+        .reason_codes
+        .iter()
+        .any(|reason| reason.starts_with("copy_trade_"))
+    {
+        info!(
+            "copy trade decision action={:?} mint={:?} lamports={:?} reasons={}",
+            decision.action,
+            decision.mint.as_deref().map(mint_prefix),
+            decision.requested_lamports,
+            decision.reason_codes.join(",")
+        );
+    }
 
     if let Some(mut order) = order_from_decision(&decision) {
         let held_token_amount_raw = positions.token_amount_for_mint(order.mint());
@@ -1039,7 +1123,8 @@ async fn process_exit_checks(
             continue;
         };
         let hold_ms = current_ms.saturating_sub(entry_ms);
-        let max_hold_ms = cfg.max_hold_seconds.saturating_mul(1_000);
+        let exit_policy = exit_policy_for_position(cfg, &position);
+        let max_hold_ms = exit_policy.max_hold_seconds.saturating_mul(1_000);
         let max_hold_elapsed = hold_ms >= max_hold_ms;
         let force_unpriced_exit = hold_ms >= max_hold_ms.saturating_add(cfg.unpriced_exit_grace_ms);
         let mut quote = curve_states.get(&mint).and_then(|state| {
@@ -1197,12 +1282,12 @@ async fn process_exit_checks(
 
         let reason = if max_hold_elapsed {
             Some("max_hold_elapsed")
-        } else if cfg.enable_take_profit_exit
+        } else if exit_policy.take_profit_enabled
             && !position.has_taken_profit
-            && pnl_bps >= cfg.take_profit_bps
+            && pnl_bps >= exit_policy.take_profit_bps
         {
             Some("take_profit_reached")
-        } else if cfg.enable_stop_loss_exit && pnl_bps <= -cfg.stop_loss_bps {
+        } else if exit_policy.stop_loss_enabled && pnl_bps <= -exit_policy.stop_loss_bps {
             Some("stop_loss_reached")
         } else {
             None
@@ -1213,7 +1298,7 @@ async fn process_exit_checks(
         let sell_token_amount_raw = if reason == "take_profit_reached" {
             position
                 .token_amount_raw
-                .saturating_mul(cfg.take_profit_sell_bps as u128)
+                .saturating_mul(exit_policy.take_profit_sell_bps as u128)
                 .checked_div(10_000)
                 .unwrap_or_default()
                 .max(1)
@@ -1283,6 +1368,38 @@ async fn process_exit_checks(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExitPolicy {
+    max_hold_seconds: i64,
+    take_profit_enabled: bool,
+    take_profit_bps: i64,
+    take_profit_sell_bps: u32,
+    stop_loss_enabled: bool,
+    stop_loss_bps: i64,
+}
+
+fn exit_policy_for_position(cfg: &Config, position: &Position) -> ExitPolicy {
+    if position.copy_trade_entry {
+        ExitPolicy {
+            max_hold_seconds: cfg.copy_trade_max_hold_seconds,
+            take_profit_enabled: cfg.copy_trade_take_profit_bps > 0,
+            take_profit_bps: cfg.copy_trade_take_profit_bps,
+            take_profit_sell_bps: cfg.copy_trade_take_profit_sell_bps,
+            stop_loss_enabled: cfg.copy_trade_stop_loss_bps > 0,
+            stop_loss_bps: cfg.copy_trade_stop_loss_bps,
+        }
+    } else {
+        ExitPolicy {
+            max_hold_seconds: cfg.max_hold_seconds,
+            take_profit_enabled: cfg.enable_take_profit_exit,
+            take_profit_bps: cfg.take_profit_bps,
+            take_profit_sell_bps: cfg.take_profit_sell_bps,
+            stop_loss_enabled: cfg.enable_stop_loss_exit,
+            stop_loss_bps: cfg.stop_loss_bps,
+        }
+    }
+}
+
 fn accept_fresh_stream_event(
     journal: &Journal,
     event: &StreamEvent,
@@ -1290,6 +1407,7 @@ fn accept_fresh_stream_event(
     max_age_ms: i64,
     stage: &str,
     stale_stream_events: &mut u64,
+    stale_log_limiter: &mut StaleLogLimiter,
 ) -> Result<bool> {
     let age_ms = now_ms().saturating_sub(received_at_ms).max(0);
     if age_ms <= max_age_ms {
@@ -1309,10 +1427,14 @@ fn accept_fresh_stream_event(
         accepted: false,
     };
     journal.record(JournalKind::StreamFreshness, &metric)?;
-    info!(
-        "stale stream event rejected signature={} source={} slot={} age_ms={} max_age_ms={} stage={}",
-        event.signature, event.source, event.slot, age_ms, max_age_ms, stage
-    );
+    if let Some(message) = stale_log_limiter.stream_message(stage, age_ms, max_age_ms) {
+        info!("{message}");
+    } else {
+        debug!(
+            "stale stream event rejected signature={} source={} slot={} age_ms={} max_age_ms={} stage={}",
+            event.signature, event.source, event.slot, age_ms, max_age_ms, stage
+        );
+    }
     Ok(false)
 }
 
@@ -1322,6 +1444,7 @@ async fn accept_fresh_create_event_slot(
     create_slot_cache: &mut SlotCache,
     event: &StreamEvent,
     cfg: &Config,
+    stale_log_limiter: &mut StaleLogLimiter,
 ) -> Result<bool> {
     if event.slot == 0 {
         record_create_slot_freshness(
@@ -1332,10 +1455,18 @@ async fn accept_fresh_create_event_slot(
             cfg.max_create_event_slot_lag,
             false,
         )?;
-        info!(
-            "stale create event rejected signature={} source={} slot=0 reason=missing_event_slot",
-            event.signature, event.source
-        );
+        if let Some(message) = stale_log_limiter.create_message(
+            "missing_event_slot",
+            None,
+            cfg.max_create_event_slot_lag,
+        ) {
+            info!("{message}");
+        } else {
+            debug!(
+                "stale create event rejected signature={} source={} slot=0 reason=missing_event_slot",
+                event.signature, event.source
+            );
+        }
         return Ok(false);
     }
 
@@ -1357,10 +1488,18 @@ async fn accept_fresh_create_event_slot(
                     cfg.max_create_event_slot_lag,
                     false,
                 )?;
-                info!(
-                    "stale create event rejected signature={} source={} slot={} reason=current_slot_unavailable error={err:#}",
-                    event.signature, event.source, event.slot
-                );
+                if let Some(message) = stale_log_limiter.create_message(
+                    "current_slot_unavailable",
+                    None,
+                    cfg.max_create_event_slot_lag,
+                ) {
+                    info!("{message}");
+                } else {
+                    debug!(
+                        "stale create event rejected signature={} source={} slot={} reason=current_slot_unavailable error={err:#}",
+                        event.signature, event.source, event.slot
+                    );
+                }
                 return Ok(false);
             }
         }
@@ -1377,15 +1516,23 @@ async fn accept_fresh_create_event_slot(
             cfg.max_create_event_slot_lag,
             false,
         )?;
-        info!(
-            "stale create event rejected signature={} source={} event_slot={} current_slot={} slot_lag={} max_slot_lag={}",
-            event.signature,
-            event.source,
-            event.slot,
-            current_slot,
-            slot_lag,
-            cfg.max_create_event_slot_lag
-        );
+        if let Some(message) = stale_log_limiter.create_message(
+            "slot_lag_exceeded",
+            Some(slot_lag),
+            cfg.max_create_event_slot_lag,
+        ) {
+            info!("{message}");
+        } else {
+            debug!(
+                "stale create event rejected signature={} source={} event_slot={} current_slot={} slot_lag={} max_slot_lag={}",
+                event.signature,
+                event.source,
+                event.slot,
+                current_slot,
+                slot_lag,
+                cfg.max_create_event_slot_lag
+            );
+        }
     }
     Ok(accepted)
 }
@@ -1521,6 +1668,207 @@ fn early_single_lifecycle_decision(
         risk_approved: false,
         risk_veto_reason: None,
     })
+}
+
+fn copy_trade_decision(
+    cfg: &Config,
+    event: &StreamEvent,
+    decoded: &DecodedTx,
+    classification: &TokenClassification,
+    context: StrategyContext,
+) -> Option<Decision> {
+    let wallet = cfg.copy_trade_wallet()?;
+    if !is_copy_trade_event(wallet, event, decoded) {
+        return None;
+    }
+
+    let timestamp_ms = decoded.timestamp_ms.unwrap_or_else(now_ms);
+    let mint = decoded.mint.clone();
+    let id = format!(
+        "decision-copy-{}-{}",
+        timestamp_ms,
+        mint.as_deref()
+            .map(mint_prefix)
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+    let ignore = |reason: &str| Decision {
+        id: id.clone(),
+        timestamp_ms,
+        source_signature: Some(decoded.signature.clone()),
+        mint: mint.clone(),
+        action: Action::Ignore,
+        mode: cfg.mode,
+        reason_codes: vec![reason.to_string()],
+        requested_lamports: None,
+        risk_approved: false,
+        risk_veto_reason: None,
+    };
+
+    if !decoded.ok {
+        return Some(ignore("copy_trade_source_tx_failed"));
+    }
+    let Some(mint_value) = mint.clone() else {
+        return Some(ignore("copy_trade_no_mint_decoded"));
+    };
+    let route_supported = classification.is_pumpfun_bonding_curve
+        || (cfg.copy_trade_allow_pumpswap && classification.is_pumpswap && cfg.mode == Mode::Paper);
+    if !route_supported {
+        return Some(ignore("copy_trade_route_unsupported"));
+    }
+
+    if decoded.side.is_sell() {
+        if cfg.copy_trade_follow_sells && context.has_position_for_mint {
+            return Some(Decision {
+                id,
+                timestamp_ms,
+                source_signature: Some(decoded.signature.clone()),
+                mint: Some(mint_value),
+                action: Action::Sell,
+                mode: cfg.mode,
+                reason_codes: vec![
+                    "copy_trade_source_sell".to_string(),
+                    format!("copy_wallet={}", mint_prefix(wallet)),
+                ],
+                requested_lamports: None,
+                risk_approved: false,
+                risk_veto_reason: None,
+            });
+        }
+        return Some(ignore("copy_trade_sell_without_open_position"));
+    }
+
+    if !decoded.side.is_buy() {
+        return Some(ignore("copy_trade_not_buy_or_sell"));
+    }
+
+    let mayhem_detected = classification.is_mayhem_candidate
+        || classification.is_mayhem_direct
+        || classification.has_verified_mayhem_evidence;
+    let mayhem_allowed = classification.has_verified_mayhem_evidence
+        || (cfg.allow_indirect_mayhem_candidates && classification.is_mayhem_candidate);
+    match cfg.market {
+        Market::NonMayhemOnly if mayhem_detected => {
+            return Some(ignore("copy_trade_non_mayhem_market_only"));
+        }
+        Market::MayhemOnly if !mayhem_allowed => {
+            return Some(ignore("copy_trade_mayhem_evidence_required"));
+        }
+        _ => {}
+    }
+
+    let observed_lamports = decoded
+        .sol_delta_lamports
+        .filter(|delta| *delta < 0)
+        .and_then(|delta| delta.checked_abs())
+        .map(|value| value as u64);
+
+    if cfg.copy_trade_min_source_buy_lamports > 0 {
+        let Some(observed) = observed_lamports else {
+            return Some(ignore("copy_trade_source_buy_size_unknown"));
+        };
+        if observed < cfg.copy_trade_min_source_buy_lamports {
+            return Some(ignore("copy_trade_source_buy_too_small"));
+        }
+    }
+
+    match cfg.copy_trade_buy_policy {
+        CopyTradeBuyPolicy::FirstOnly
+            if context.buys_for_mint > 0 || context.has_position_for_mint =>
+        {
+            return Some(ignore("copy_trade_first_buy_only"));
+        }
+        CopyTradeBuyPolicy::Accumulate
+            if context.buys_for_mint >= cfg.copy_trade_max_buys_per_mint =>
+        {
+            return Some(ignore("copy_trade_max_buys_per_mint"));
+        }
+        _ => {}
+    }
+
+    let requested_lamports = copy_trade_buy_lamports(cfg, observed_lamports);
+    if requested_lamports == 0 {
+        return Some(ignore("copy_trade_zero_buy_size"));
+    }
+
+    let mut reasons = vec![
+        "copy_trade_source_buy".to_string(),
+        format!("copy_wallet={}", mint_prefix(wallet)),
+        format!("copy_sizing={}", cfg.copy_trade_sizing.as_str()),
+        format!("copy_buy_policy={}", cfg.copy_trade_buy_policy.as_str()),
+        format!("copy_max_lamports={}", cfg.copy_trade_max_buy_lamports),
+    ];
+    if let Some(observed) = observed_lamports {
+        reasons.push(format!("observed_lamports={observed}"));
+    }
+    if requested_lamports == cfg.copy_trade_max_buy_lamports {
+        reasons.push("copy_size_capped".to_string());
+    }
+
+    Some(Decision {
+        id,
+        timestamp_ms,
+        source_signature: Some(decoded.signature.clone()),
+        mint: Some(mint_value),
+        action: Action::Buy,
+        mode: cfg.mode,
+        reason_codes: reasons,
+        requested_lamports: Some(requested_lamports),
+        risk_approved: false,
+        risk_veto_reason: None,
+    })
+}
+
+fn copy_trade_buy_lamports(cfg: &Config, observed_lamports: Option<u64>) -> u64 {
+    let base = match cfg.copy_trade_sizing {
+        CopyTradeSizing::Fixed => cfg.base_buy_lamports,
+        CopyTradeSizing::Mirror => observed_lamports.unwrap_or(cfg.base_buy_lamports),
+        CopyTradeSizing::Scaled => {
+            observed_lamports
+                .unwrap_or(cfg.base_buy_lamports)
+                .saturating_mul(cfg.copy_trade_scale_bps as u64)
+                / 10_000
+        }
+    };
+    base.min(cfg.copy_trade_max_buy_lamports)
+}
+
+fn is_copy_trade_stream_source(cfg: &Config, event: &StreamEvent) -> bool {
+    let Some(wallet) = cfg.copy_trade_wallet() else {
+        return false;
+    };
+    event
+        .source
+        .strip_prefix("logsSubscribe:")
+        .or_else(|| event.source.strip_prefix("backfill:"))
+        .is_some_and(|mention| mention == wallet)
+}
+
+fn wallet_for_delta_for_event<'a>(
+    cfg: &'a Config,
+    event: &'a StreamEvent,
+    default_wallet: Option<&'a str>,
+) -> Option<&'a str> {
+    if is_copy_trade_stream_source(cfg, event) {
+        return cfg.copy_trade_wallet();
+    }
+    event
+        .source
+        .strip_prefix("logsSubscribe:")
+        .or_else(|| event.source.strip_prefix("backfill:"))
+        .filter(|wallet| {
+            cfg.target_wallet.as_deref() == Some(*wallet)
+                || cfg.watched_wallets.iter().any(|watched| watched == wallet)
+        })
+        .or(default_wallet)
+}
+
+fn is_copy_trade_event(wallet: &str, event: &StreamEvent, decoded: &DecodedTx) -> bool {
+    event
+        .source
+        .strip_prefix("logsSubscribe:")
+        .or_else(|| event.source.strip_prefix("backfill:"))
+        .is_some_and(|mention| mention == wallet)
+        || decoded.signer.as_deref() == Some(wallet)
 }
 
 fn observed_agent_buy_exit_decision(
@@ -2502,6 +2850,89 @@ mod lifecycle_tests {
         }
     }
 
+    fn copy_cfg() -> Config {
+        Config {
+            copy_trade_enabled: true,
+            copy_trade_wallet: "11111111111111111111111111111111".to_string(),
+            copy_trade_max_buy_lamports: 10_000_000,
+            market: Market::AllPumpfun,
+            ..live_cfg(false)
+        }
+    }
+
+    fn copy_classification(mint: &str) -> TokenClassification {
+        TokenClassification {
+            mint: Some(mint.to_string()),
+            is_pumpfun_bonding_curve: true,
+            is_pumpswap: false,
+            is_mayhem_direct: false,
+            is_mayhem_candidate: false,
+            has_verified_mayhem_evidence: false,
+            is_axiom_route: false,
+            is_axiom_jito_route: false,
+            has_confirmed_execution_route: false,
+            is_token_2022: false,
+            is_fresh_launch: false,
+            is_reference_wallet_seen: true,
+            score: 1.0,
+            reasons: vec!["test".to_string()],
+        }
+    }
+
+    fn copy_event(cfg: &Config) -> StreamEvent {
+        StreamEvent {
+            source: format!("logsSubscribe:{}", cfg.copy_trade_wallet),
+            signature: "copy-signature".to_string(),
+            slot: 42,
+            received_at_ms: 1_500,
+            logs: Vec::new(),
+            raw: serde_json::json!({}),
+        }
+    }
+
+    fn copy_decoded(
+        cfg: &Config,
+        mint: &str,
+        side: TradeSide,
+        sol_delta: Option<i64>,
+    ) -> DecodedTx {
+        DecodedTx {
+            signature: "copy-signature".to_string(),
+            slot: 42,
+            timestamp_ms: Some(1_500),
+            ok: true,
+            side,
+            instruction_names: vec![],
+            program_ids: vec![cfg.pumpfun_program.clone()],
+            account_keys: vec![cfg.copy_trade_wallet.clone()],
+            mint: Some(mint.to_string()),
+            signer: Some(cfg.copy_trade_wallet.clone()),
+            sol_delta_lamports: sol_delta,
+            token_delta_raw: Some(1),
+            fee_lamports: Some(5_000),
+            logs: Vec::new(),
+            err: None,
+        }
+    }
+
+    fn copy_context(has_position: bool) -> StrategyContext {
+        copy_context_with_buys(has_position, 0)
+    }
+
+    fn copy_context_with_buys(has_position: bool, buys_for_mint: u32) -> StrategyContext {
+        StrategyContext {
+            open_positions: usize::from(has_position),
+            has_position_for_mint: has_position,
+            buys_for_mint,
+            has_discovery_signal: false,
+            has_fresh_mint_discovery: false,
+            discovery_seen_ts_ms: None,
+            observed_buy_lamports: None,
+            observed_buys_for_mint: 0,
+            observed_sells_for_mint: 0,
+        }
+    }
+
     #[test]
     fn live_single_lifecycle_tracks_pending_and_open_work() {
         let disabled = live_cfg(false);
@@ -2610,6 +3041,258 @@ mod lifecycle_tests {
             observed_agent_buy_exit_decision(&cfg, &event, &after_entry, &positions, 1_500,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn copy_trade_buy_uses_configured_sizing_and_cap() {
+        let mut cfg = copy_cfg();
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let event = copy_event(&cfg);
+        let decoded = copy_decoded(&cfg, mint, TradeSide::Buy, Some(-8_000_000));
+        let classification = copy_classification(mint);
+
+        cfg.copy_trade_sizing = CopyTradeSizing::Fixed;
+        cfg.base_buy_lamports = 5_000_000;
+        let fixed =
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false))
+                .expect("copy wallet buy should produce decision");
+        assert_eq!(fixed.action, Action::Buy);
+        assert_eq!(fixed.requested_lamports, Some(5_000_000));
+
+        cfg.copy_trade_sizing = CopyTradeSizing::Mirror;
+        cfg.copy_trade_max_buy_lamports = 6_000_000;
+        let mirrored =
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false))
+                .expect("copy wallet buy should produce decision");
+        assert_eq!(mirrored.requested_lamports, Some(6_000_000));
+        assert!(mirrored
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_size_capped"));
+    }
+
+    #[test]
+    fn copy_trade_respects_market_filter_for_buys() {
+        let mut cfg = copy_cfg();
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let event = copy_event(&cfg);
+        let decoded = copy_decoded(&cfg, mint, TradeSide::Buy, Some(-8_000_000));
+        let mut classification = copy_classification(mint);
+        classification.is_mayhem_candidate = true;
+
+        cfg.market = Market::NonMayhemOnly;
+        let non_mayhem =
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false))
+                .expect("copy wallet buy should be recorded");
+        assert_eq!(non_mayhem.action, Action::Ignore);
+        assert!(non_mayhem
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_non_mayhem_market_only"));
+
+        cfg.market = Market::MayhemOnly;
+        classification.is_mayhem_candidate = false;
+        classification.has_verified_mayhem_evidence = false;
+        let mayhem_only =
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false))
+                .expect("copy wallet buy should be recorded");
+        assert_eq!(mayhem_only.action, Action::Ignore);
+        assert!(mayhem_only
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_mayhem_evidence_required"));
+    }
+
+    #[test]
+    fn copy_trade_source_sell_follows_open_position_only() {
+        let cfg = copy_cfg();
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let event = copy_event(&cfg);
+        let decoded = copy_decoded(&cfg, mint, TradeSide::Sell, Some(7_000_000));
+        let classification = copy_classification(mint);
+
+        let sell = copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(true))
+            .expect("copy wallet sell should produce decision");
+        assert_eq!(sell.action, Action::Sell);
+        assert!(sell
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_source_sell"));
+
+        let ignored =
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false))
+                .expect("copy wallet sell without position should be recorded as ignore");
+        assert_eq!(ignored.action, Action::Ignore);
+        assert!(ignored
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_sell_without_open_position"));
+    }
+
+    #[test]
+    fn copy_trade_first_only_blocks_repeat_buys() {
+        let mut cfg = copy_cfg();
+        cfg.copy_trade_buy_policy = CopyTradeBuyPolicy::FirstOnly;
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let event = copy_event(&cfg);
+        let decoded = copy_decoded(&cfg, mint, TradeSide::Buy, Some(-8_000_000));
+        let classification = copy_classification(mint);
+
+        let first =
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false))
+                .expect("first source buy should produce a decision");
+        assert_eq!(first.action, Action::Buy);
+
+        let repeat = copy_trade_decision(
+            &cfg,
+            &event,
+            &decoded,
+            &classification,
+            copy_context_with_buys(true, 1),
+        )
+        .expect("repeat source buy should be recorded");
+        assert_eq!(repeat.action, Action::Ignore);
+        assert!(repeat
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_first_buy_only"));
+    }
+
+    #[test]
+    fn copy_trade_accumulate_respects_copy_buy_limit_and_source_min() {
+        let mut cfg = copy_cfg();
+        cfg.copy_trade_buy_policy = CopyTradeBuyPolicy::Accumulate;
+        cfg.copy_trade_max_buys_per_mint = 2;
+        cfg.copy_trade_min_source_buy_lamports = 7_000_000;
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let event = copy_event(&cfg);
+        let classification = copy_classification(mint);
+
+        let tiny = copy_decoded(&cfg, mint, TradeSide::Buy, Some(-6_000_000));
+        let ignored_small =
+            copy_trade_decision(&cfg, &event, &tiny, &classification, copy_context(false))
+                .expect("small source buy should be recorded");
+        assert_eq!(ignored_small.action, Action::Ignore);
+        assert!(ignored_small
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_source_buy_too_small"));
+
+        let qualifying = copy_decoded(&cfg, mint, TradeSide::Buy, Some(-8_000_000));
+        let second = copy_trade_decision(
+            &cfg,
+            &event,
+            &qualifying,
+            &classification,
+            copy_context_with_buys(true, 1),
+        )
+        .expect("second copied buy should be allowed");
+        assert_eq!(second.action, Action::Buy);
+
+        let third = copy_trade_decision(
+            &cfg,
+            &event,
+            &qualifying,
+            &classification,
+            copy_context_with_buys(true, 2),
+        )
+        .expect("over-limit source buy should be recorded");
+        assert_eq!(third.action, Action::Ignore);
+        assert!(third
+            .reason_codes
+            .iter()
+            .any(|reason| reason == "copy_trade_max_buys_per_mint"));
+    }
+
+    #[test]
+    fn copy_trade_ignores_non_signer_account_key_mentions() {
+        let cfg = copy_cfg();
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let event = StreamEvent {
+            source: "logsSubscribe:program".to_string(),
+            signature: "program-signature".to_string(),
+            slot: 42,
+            received_at_ms: 1_500,
+            logs: Vec::new(),
+            raw: serde_json::json!({}),
+        };
+        let mut decoded = copy_decoded(&cfg, mint, TradeSide::Buy, Some(-8_000_000));
+        decoded.signer = Some("OtherSigner111111111111111111111111111111".to_string());
+        decoded.account_keys = vec![cfg.copy_trade_wallet.clone()];
+        let classification = copy_classification(mint);
+
+        assert!(
+            copy_trade_decision(&cfg, &event, &decoded, &classification, copy_context(false),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn copy_wallet_delta_is_selected_only_for_copy_wallet_streams() {
+        let mut cfg = copy_cfg();
+        cfg.target_wallet = Some("TargetWallet111111111111111111111111111111".to_string());
+        cfg.watched_wallets = vec!["WatchWallet1111111111111111111111111111111".to_string()];
+
+        let program_event = StreamEvent {
+            source: "logsSubscribe:program".to_string(),
+            signature: "program-signature".to_string(),
+            slot: 42,
+            received_at_ms: 1_500,
+            logs: Vec::new(),
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(
+            wallet_for_delta_for_event(&cfg, &program_event, Some("DefaultWallet")),
+            Some("DefaultWallet")
+        );
+
+        let copy_event = copy_event(&cfg);
+        assert_eq!(
+            wallet_for_delta_for_event(&cfg, &copy_event, Some("DefaultWallet")),
+            cfg.copy_trade_wallet()
+        );
+
+        let target_event = StreamEvent {
+            source: "logsSubscribe:TargetWallet111111111111111111111111111111".to_string(),
+            signature: "target-signature".to_string(),
+            slot: 42,
+            received_at_ms: 1_500,
+            logs: Vec::new(),
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(
+            wallet_for_delta_for_event(&cfg, &target_event, Some("DefaultWallet")),
+            cfg.target_wallet.as_deref()
+        );
+    }
+
+    #[test]
+    fn copy_trade_positions_use_copy_exit_policy() {
+        let mut cfg = copy_cfg();
+        cfg.max_hold_seconds = 999;
+        cfg.take_profit_bps = 9_999;
+        cfg.take_profit_sell_bps = 5_000;
+        cfg.stop_loss_bps = 9_999;
+        cfg.copy_trade_max_hold_seconds = 7;
+        cfg.copy_trade_take_profit_bps = 1_500;
+        cfg.copy_trade_take_profit_sell_bps = 10_000;
+        cfg.copy_trade_stop_loss_bps = 800;
+
+        let mint = "FreshMint111111111111111111111111111111111111";
+        let mut positions = PositionManager::default();
+        let mut buy = buy_order(mint);
+        buy.source_decision_id = "decision-copy-1500-FreshMin".to_string();
+        positions.record_buy(&buy, &execution_report(ExecutionStatus::LiveConfirmed));
+
+        let position = positions
+            .position_for_mint(mint)
+            .expect("copy buy should open position");
+        assert!(position.copy_trade_entry);
+        let policy = exit_policy_for_position(&cfg, position);
+        assert_eq!(policy.max_hold_seconds, 7);
+        assert_eq!(policy.take_profit_bps, 1_500);
+        assert_eq!(policy.take_profit_sell_bps, 10_000);
+        assert_eq!(policy.stop_loss_bps, 800);
     }
 }
 
@@ -2722,5 +3405,38 @@ mod tests {
         report.filled_lamports = Some(12_703_394);
         report.filled_token_amount_raw = Some(505_470_592_937);
         assert!(!zero_inventory_without_sell_broadcast(&report));
+    }
+
+    #[test]
+    fn stale_log_limiter_summarizes_stream_rejections() {
+        let mut limiter = StaleLogLimiter::default();
+        assert!(limiter.stream_message("queued", 600, 500).is_some());
+        for _ in 2..STALE_STREAM_LOG_EVERY {
+            assert!(limiter.stream_message("queued", 600, 500).is_none());
+        }
+        let message = limiter
+            .stream_message("after_fetch", 900, 500)
+            .expect("every Nth stale stream rejection should summarize");
+        assert!(message.contains("count=100"));
+        assert!(message.contains("latest_stage=after_fetch"));
+    }
+
+    #[test]
+    fn stale_log_limiter_summarizes_create_rejections() {
+        let mut limiter = StaleLogLimiter::default();
+        assert!(limiter
+            .create_message("missing_event_slot", None, 4)
+            .is_some());
+        for _ in 2..STALE_CREATE_LOG_EVERY {
+            assert!(limiter
+                .create_message("missing_event_slot", None, 4)
+                .is_none());
+        }
+        let message = limiter
+            .create_message("slot_lag_exceeded", Some(12), 4)
+            .expect("every Nth stale create rejection should summarize");
+        assert!(message.contains("count=25"));
+        assert!(message.contains("latest_reason=slot_lag_exceeded"));
+        assert!(message.contains("latest_slot_lag=12"));
     }
 }

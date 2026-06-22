@@ -6,7 +6,7 @@
 # see .env.example.
 #
 # Required to do anything useful: mode, helius_api_key (or HELIUS_API_KEY
-# in .env), and base_buy_lamports. The rest have safe defaults.
+# in .env), and base_buy_sol. The rest have safe defaults.
 
 mode = "paper"                  # default for direct scan/bot runs; TUI Live/Paper picker overrides this
 helius_api_key = "PUT_YOUR_HELIUS_KEY_HERE"  # required (or set HELIUS_API_KEY in .env)
@@ -19,12 +19,11 @@ mayhem_agent_wallet = "BwWK17cbHxwWBKZkUYvzxLcNQ1YVyaFezduWbtm2de6s"
 token_2022_program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 axiom_route_program = "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9"
 axiom_jito_marker = "jitodontfrontB1111111TradeWithAxiomDotTrade"
-pair_scope = "mayhem_only" # [Auto Bot Setup] "mayhem_only" or "all_pumpfun"
+market = "mayhem_only" # [Settings + Auto Bot Setup] mayhem_only | non_mayhem_only | all_pumpfun
 
-# Strict default: generic pumpfun/token-2022 candidates are observable only.
-# The bot enters only when:
-# 1. the mint is verified by a trusted Mayhem mint source, and
-# 2. the observed execution route matches the wallet pattern: Axiom -> Pump.fun/PumpSwap.
+# Strict default: Mayhem-only market. Generic Pump.fun candidates are observable
+# unless market is set to non_mayhem_only or all_pumpfun. non_mayhem_only is
+# fresh-create only and requires curve is_mayhem_mode=false; unknown flags skip.
 require_mayhem_evidence = true
 allow_indirect_mayhem_candidates = false
 require_route_confirmation = true
@@ -38,7 +37,7 @@ pulse_mints_path = "" # optional live JSONL file tailed for verified discoveries
 require_discovery_signal = false
 allow_onchain_mayhem_discovery = true
 require_curve_mayhem_flag = false
-require_fresh_mint_creation = false # live speed mode should require Pump Create/CreateV2
+require_fresh_mint_creation = false # non_mayhem_only always requires fresh Pump Create/CreateV2
 max_stream_event_age_ms = 500 # reject events delayed in the local queue
 entry_deadline_ms = 550
 max_create_event_slot_lag = 2 # reject create events already behind the current slot
@@ -46,21 +45,43 @@ max_entry_curve_slot_ahead = 8
 
 # Optional opponent-model filters for observed wallet/agent buys.
 # Omit max_* values to leave them unlimited.
-min_observed_buy_lamports = 0
-# max_observed_buy_lamports = 500000000
+min_observed_buy_sol = 0
+# max_observed_buy_sol = 0.5
 # max_observed_buys_before_entry = 1
 # max_observed_sells_before_entry = 0
 
-# Reference wallet is optional; used for SOL delta reconstruction when watching it.
-target_wallet = "8UbptT8bqtXVKvHkMwEkWqrRLQ5mTs2whQbY5Twfwhfi"
+# Optional reference wallets. Leave `target_wallet` unset unless you
+# intentionally want one wallet to act as a reference signal/delta owner.
+# target_wallet = "REFERENCE_WALLET_PUBKEY"
 watched_wallets = []
 
-base_buy_lamports = 13025001    # [Settings + Auto Bot Setup] buy size in lamports (1 SOL = 1e9)
-max_open_positions = 3          # max concurrent open positions
-max_buys_per_mint = 5
-max_total_lamports_per_mint = 100000000
-max_total_open_lamports = 300000000
-max_daily_loss_lamports = 500000000  # daily loss limit
+# Copy trade is edited from Auto Bot Setup. When enabled, Catarnith watches
+# `copy_trade_wallet`, buys after that wallet buys a supported Pump.fun mint,
+# and sells when that wallet sells the same mint. Existing market selection and
+# risk caps still apply, and live PumpSwap copy execution is intentionally
+# disabled for now.
+copy_trade_enabled = false
+copy_trade_wallet = ""
+copy_trade_sizing = "fixed" # fixed | mirror | scaled
+copy_trade_scale_bps = 10000 # 10000 = 1.0x when sizing="scaled"
+copy_trade_max_buy_sol = 0.013025001
+copy_trade_buy_policy = "first_only" # first_only | accumulate
+copy_trade_max_buys_per_mint = 1
+copy_trade_min_source_buy_sol = 0 # 0 disables this source-size filter
+copy_trade_max_hold_seconds = 180
+copy_trade_take_profit_bps = 8000 # 0 disables copy-specific take profit
+copy_trade_take_profit_sell_bps = 10000
+copy_trade_stop_loss_bps = 3500 # 0 disables copy-specific stop loss
+copy_trade_follow_sells = true
+copy_trade_allow_pumpswap = false # paper/research only; live PumpSwap execution is not implemented
+bot_keep_alive = true # restart the child bot if streams/process exit unexpectedly
+
+base_buy_sol = 0.013025001      # [Settings + Auto Bot Setup] buy size in SOL
+max_open_positions = 3          # [Auto Bot Setup advanced] max concurrent open positions
+max_buys_per_mint = 5           # [Auto Bot Setup advanced] max buys per mint
+max_total_sol_per_mint = 0.1    # [Auto Bot Setup advanced] per-mint exposure cap
+max_total_open_sol = 0.3        # [Auto Bot Setup advanced] total open exposure cap
+max_daily_loss_sol = 0.5        # [Auto Bot Setup advanced] daily loss limit
 max_failed_txs_per_minute = 30
 max_failed_fee_burn_lamports_per_hour = 20000000
 max_slippage_bps = 1500         # [Settings + Auto Bot Setup] max buy slippage in bps
@@ -99,7 +120,7 @@ use_observed_entry_fill = false
 backfill_limit = 0
 
 journal_dir = "journals/bot"
-sqlite_path = "journals/bot/mayhem.sqlite"
+sqlite_path = "journals/bot/catarnith.sqlite"
 paper_report_path = ""
 horizon_report_path = ""
 
@@ -113,8 +134,9 @@ horizon_report_path = ""
 #   require_manual_live_unlock = false
 # and provide a hot-wallet key (wallet_keypair_path or the base58 key in
 # .env). Protective gates still apply: the wallet must live outside the
-# repo, secret files must be chmod 600, CTARNITH_FALLBACK_RPC_URL must be a
-# distinct paid RPC, and max_balance_lamports caps the wallet size.
+# repo, secret files must be chmod 600, optional CTARNITH_FALLBACK_RPC_URL
+# must be distinct from the primary RPC, and max_balance_sol caps the
+# wallet size.
 [live]
 compute_unit_limit = 400000               # CTARNITH_LIVE_COMPUTE_UNIT_LIMIT
 compute_unit_price_microlamports = 100000 # [Settings advanced live] CTARNITH_LIVE_COMPUTE_UNIT_PRICE_MICROLAMPORTS (priority fee)
@@ -127,9 +149,9 @@ confirmation_poll_ms = 200                # [Settings advanced live] CTARNITH_LI
 pre_broadcast_simulation = true           # [Settings advanced live] CTARNITH_LIVE_PRE_BROADCAST_SIMULATION
 settlement_commitment = "processed"       # CTARNITH_LIVE_SETTLEMENT_COMMITMENT (processed|confirmed|finalized)
 sell_slippage_bps = 1500                  # [Settings advanced live] CTARNITH_LIVE_SELL_SLIPPAGE_BPS
-max_balance_lamports = 50000000           # [Settings advanced live] CTARNITH_LIVE_MAX_BALANCE_LAMPORTS (refuse to trade above this; 0.05 SOL)
+max_balance_sol = 0.05                    # [Settings advanced live] CTARNITH_LIVE_MAX_BALANCE_SOL
 jito_block_engine_url = "https://singapore.mainnet.block-engine.jito.wtf/api/v1/transactions" # [Settings advanced live]
-jito_tip_lamports = 100000                # [Settings advanced live] CTARNITH_LIVE_JITO_TIP_LAMPORTS
+jito_tip_sol = 0.0001                     # [Settings advanced live] CTARNITH_LIVE_JITO_TIP_SOL
 jupiter_timeout_ms = 10000                # CTARNITH_LIVE_JUPITER_TIMEOUT_MS (sell fallback; needs JUP_API_KEY in .env)
 # Optional Jito panic-sell tip path. Set both to enable.
 # jito_tip_account = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"                     # CTARNITH_LIVE_JITO_TIP_ACCOUNT
